@@ -273,9 +273,11 @@
 				<span class="logo-text">BLOCKBERG</span>
 			</div>
 			<div class="nav-links">
-				<a href="/" class="nav-link active">Home</a>
+				<a href="/landing" class="nav-link active">Home</a>
 				<a href="#trading" class="nav-link">Trading</a>
 				<a href="/competition" class="nav-link">Competition</a>
+				<a href="/" class="nav-link">Terminal</a>
+				<a href="/dashboard" class="nav-link">Dashboard</a>
 			</div>
 			<div class="nav-wallet">
 				<WalletButton />

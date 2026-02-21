@@ -61,7 +61,8 @@ export const PAIR_SYMBOLS: Record<number, string> = {
   0: 'SOL/USDT',
   1: 'BTC/USDT',
   2: 'ETH/USDT',
-  3: 'AVAX/USDT'
+  3: 'AVAX/USDT',
+  4: 'LINK/USDT'
 };
 
 // Helper function to convert database trade to frontend format
@@ -81,10 +82,17 @@ export function convertTradePostFromDB(dbTrade: TradePostDB): TradePost {
     const minutes = date.getMinutes().toString().padStart(2, '0');
     return `${month} ${day}, ${hours}:${minutes}`;
   };
+
+  // Use author_username if set, otherwise format wallet address (owner_pubkey)
+  const formatAddress = (addr: string): string => {
+    if (!addr || addr.length < 12) return addr || 'Unknown';
+    return `${addr.slice(0, 4)}...${addr.slice(-4)}`;
+  };
+  const author = dbTrade.author_username?.trim() || formatAddress(dbTrade.owner_pubkey);
   
   return {
     id: dbTrade.id,
-    author: dbTrade.author_username || 'Anonymous',
+    author,
     symbol: PAIR_SYMBOLS[dbTrade.pair_index] || 'UNKNOWN',
     direction: dbTrade.position_type.toUpperCase() as 'LONG' | 'SHORT',
     entry: entryPrice,

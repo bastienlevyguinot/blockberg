@@ -70,11 +70,11 @@ export const load: PageLoad = async () => {
   }
 
   try {
-    // Fetch trade posts from Supabase
+    // Fetch trade posts from Supabase (newest posts first)
     const { data, error } = await supabase
       .from('trade_posts')
       .select('*')
-      .order('closed_at', { ascending: false })
+      .order('created_at', { ascending: false })
       .limit(20); // Get the 20 most recent trades
 
     if (error) {

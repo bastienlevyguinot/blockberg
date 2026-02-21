@@ -1,11 +1,12 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { HermesClient } from '@pythnetwork/hermes-client';
-	import { magicBlockClient, TRADING_PAIRS } from '$lib/magicblock';
+	import { magicBlockClient, TRADING_PAIRS, PAIR_DECIMALS } from '$lib/magicblock';
 	import { walletStore } from '$lib/wallet/stores';
 	import WalletButton from '$lib/wallet/WalletButton.svelte';
 	import Toast from '$lib/toast/Toast.svelte';
 	import { toastStore } from '$lib/toast/store';
+	import { supabase, isSupabaseConfigured } from '$lib/supabase';
 
 	const hermesClient = new HermesClient('https://hermes.pyth.network', {});
 
@@ -245,6 +246,102 @@
 		}
 	}
 
+	// Post trade to Supabase
+	let showPostModal = false;
+	let selectedTradeForPost: any = null;
+	let postAnalysis = '';
+	let isPosting = false;
+
+	function openPostModal(trade: any) {
+		selectedTradeForPost = trade;
+		postAnalysis = '';
+		showPostModal = true;
+	}
+
+	function closePostModal() {
+		showPostModal = false;
+		selectedTradeForPost = null;
+		postAnalysis = '';
+	}
+
+	async function postTradeToSupabase() {
+		if (!supabase || !isSupabaseConfigured) {
+			toastStore.error('Not Configured', 'Supabase is not configured. Please set up your .env file.');
+			return;
+		}
+		if (!selectedTradeForPost || !walletAddress) return;
+
+		const trade = selectedTradeForPost;
+		// Only LONG/SHORT positions can be posted
+		if (trade.tradeType !== 'LONG' && trade.tradeType !== 'SHORT') {
+			toastStore.error('Invalid Trade', 'Only closed LONG/SHORT positions can be posted.');
+			return;
+		}
+
+		isPosting = true;
+		try {
+			const pairIndex = trade.pairIndex ?? TRADING_PAIRS[trade.pairSymbol as keyof typeof TRADING_PAIRS];
+			const pairDecimals = PAIR_DECIMALS[pairIndex as keyof typeof PAIR_DECIMALS];
+			if (!pairDecimals) {
+				throw new Error('Unknown trading pair');
+			}
+
+			// Convert to database format (prices: 6 decimals, amount: token decimals)
+			const amountTokenOut = BigInt(Math.round((trade.size || 0) * Math.pow(10, pairDecimals.tokenOut)));
+			const entryPrice = BigInt(Math.round((trade.entryPrice || 0) * 1e6));
+			const exitPrice = BigInt(Math.round((trade.exitPrice || trade.entryPrice || 0) * 1e6));
+			const takeProfitPrice = trade.takeProfitPrice
+				? BigInt(Math.round(trade.takeProfitPrice * 1e6))
+				: null;
+			const stopLossPrice = trade.stopLossPrice
+				? BigInt(Math.round(trade.stopLossPrice * 1e6))
+				: null;
+			const openedAt = trade.openedAt
+				? BigInt(Math.floor(trade.openedAt.getTime() / 1000))
+				: BigInt(0);
+			const closedAt = trade.closedAt
+				? BigInt(Math.floor(trade.closedAt.getTime() / 1000))
+				: BigInt(Math.floor(Date.now() / 1000));
+
+			// Use truncated wallet as author display
+			const authorDisplay = walletAddress ? `${walletAddress.slice(0, 4)}...${walletAddress.slice(-4)}` : null;
+
+			const { error } = await supabase.from('trade_posts').insert({
+				owner_pubkey: walletAddress,
+				pair_index: pairIndex,
+				position_id: parseInt(trade.positionId || '0', 10),
+				position_type: trade.tradeType === 'LONG' ? 'Long' : 'Short',
+				amount_token_out: amountTokenOut.toString(),
+				entry_price: entryPrice.toString(),
+				exit_price: exitPrice.toString(),
+				take_profit_price: takeProfitPrice?.toString() ?? null,
+				stop_loss_price: stopLossPrice?.toString() ?? null,
+				opened_at: openedAt.toString(),
+				closed_at: closedAt.toString(),
+				position_pubkey: trade.pubkey || null,
+				author_username: authorDisplay,
+				analysis: postAnalysis.trim() || null
+			});
+
+			if (error) {
+				if (error.code === '23505') {
+					toastStore.error('Already Posted', 'This trade has already been posted to the feed.');
+				} else {
+					throw error;
+				}
+				return;
+			}
+
+			toastStore.success('Trade Posted', 'Your trade is now live! View it on the landing page.');
+			closePostModal();
+		} catch (error: any) {
+			console.error('Error posting trade:', error);
+			toastStore.error('Post Failed', error.message || 'Failed to post trade');
+		} finally {
+			isPosting = false;
+		}
+	}
+
 	// Update time every second and fetch prices
 	onMount(() => {
 		const timeInterval = setInterval(() => {
@@ -270,6 +367,7 @@
 		<div class="nav-links">
 			<a href="/" class="nav-link">TERMINAL</a>
 			<a href="/dashboard" class="nav-link active">DASHBOARD</a>
+			<a href="/landing" class="nav-link">TRADE IDEAS</a>
 			<a href="/competition" class="nav-link">COMPETITION</a>
 		</div>
 		<div class="header-right">
@@ -426,6 +524,7 @@
 									<span>ENTRY</span>
 									<span>EXIT</span>
 									<span>P&L</span>
+									<span>ACTION</span>
 								</div>
 								{#each tradeHistory as trade}
 									<div class="table-row">
@@ -450,6 +549,20 @@
 												—
 											{/if}
 										</span>
+										<span class="action-cell">
+											{#if trade.tradeType === 'LONG' || trade.tradeType === 'SHORT'}
+												<button
+													class="post-btn"
+													on:click={() => openPostModal(trade)}
+													disabled={!isSupabaseConfigured}
+													title={isSupabaseConfigured ? 'Share this trade to the feed' : 'Supabase not configured'}
+												>
+													POST
+												</button>
+											{:else}
+												—
+											{/if}
+										</span>
 									</div>
 								{/each}
 							</div>
@@ -461,6 +574,44 @@
 			</div>
 		{/if}
 	</div>
+
+	<!-- Post Trade Modal -->
+	{#if showPostModal}
+		<div class="modal-overlay" on:click={closePostModal} role="button" tabindex="0" on:keydown={(e) => e.key === 'Escape' && closePostModal()}>
+			<div class="modal-content" on:click|stopPropagation role="dialog" aria-modal="true" aria-labelledby="modal-title">
+				<div class="modal-header">
+					<h2 id="modal-title">Post Trade to Feed</h2>
+					<button class="modal-close" on:click={closePostModal} aria-label="Close">&times;</button>
+				</div>
+				{#if selectedTradeForPost}
+					<div class="modal-trade-summary">
+						<span class="trade-badge">{selectedTradeForPost.pair}</span>
+						<span class="trade-badge {selectedTradeForPost.tradeType?.toLowerCase()}">
+							{selectedTradeForPost.tradeType}
+						</span>
+						<span>{selectedTradeForPost.size?.toFixed(4)} @ ${selectedTradeForPost.entryPrice?.toFixed(4)} → ${selectedTradeForPost.exitPrice?.toFixed(4)}</span>
+						<span class="pnl" class:positive={(selectedTradeForPost.pnl || 0) >= 0} class:negative={(selectedTradeForPost.pnl || 0) < 0}>
+							{selectedTradeForPost.pnl >= 0 ? '+' : ''}${selectedTradeForPost.pnl?.toFixed(4) || '0'}
+						</span>
+					</div>
+					<label for="post-analysis" class="modal-label">Analysis / Description (optional)</label>
+					<textarea
+						id="post-analysis"
+						class="modal-textarea"
+						placeholder="Share your trade analysis, setup, or lessons learned..."
+						bind:value={postAnalysis}
+						rows="4"
+					></textarea>
+				{/if}
+				<div class="modal-actions">
+					<button class="modal-btn cancel" on:click={closePostModal} disabled={isPosting}>Cancel</button>
+					<button class="modal-btn primary" on:click={postTradeToSupabase} disabled={isPosting}>
+						{isPosting ? 'Posting...' : 'Post to Feed'}
+					</button>
+				</div>
+			</div>
+		</div>
+	{/if}
 
 	<footer class="footer">
 		<div class="footer-content">
@@ -731,12 +882,12 @@
 	}
 
 	.history-table .table-header {
-		grid-template-columns: 1.2fr 1fr 1fr 1fr 1fr 1fr 1fr;
+		grid-template-columns: 1.2fr 1fr 1fr 1fr 1fr 1fr 1fr 0.8fr;
 	}
 
 	.table-row {
 		display: grid;
-		grid-template-columns: 1fr 1fr 1fr 1fr 1.5fr 1fr 1fr;
+		grid-template-columns: 1fr 1fr 1fr 1fr 1.5fr 1fr 1fr 0.8fr;
 		gap: 10px;
 		padding: 12px 0;
 		border-bottom: 1px solid #222;
@@ -746,7 +897,7 @@
 	}
 
 	.history-table .table-row {
-		grid-template-columns: 1.2fr 1fr 1fr 1fr 1fr 1fr 1fr;
+		grid-template-columns: 1.2fr 1fr 1fr 1fr 1fr 1fr 1fr 0.8fr;
 	}
 
 	.table-row:hover {
@@ -803,6 +954,191 @@
 	.close-btn:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+
+	.post-btn {
+		background: none;
+		border: 1px solid #ff9500;
+		color: #ff9500;
+		padding: 4px 12px;
+		font-size: 10px;
+		font-weight: bold;
+		cursor: pointer;
+		font-family: 'Courier New', monospace;
+		letter-spacing: 1px;
+		transition: all 0.2s ease;
+	}
+
+	.post-btn:hover:not(:disabled) {
+		background: #ff9500;
+		color: #000;
+	}
+
+	.post-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+		border-color: #555;
+		color: #666;
+	}
+
+	.action-cell {
+		display: flex;
+		align-items: center;
+	}
+
+	/* Post Trade Modal */
+	.modal-overlay {
+		position: fixed;
+		inset: 0;
+		background: rgba(0, 0, 0, 0.8);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		z-index: 1000;
+		padding: 20px;
+	}
+
+	.modal-content {
+		background: #0a0a0a;
+		border: 1px solid #333;
+		max-width: 480px;
+		width: 100%;
+		padding: 24px;
+	}
+
+	.modal-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 20px;
+		border-bottom: 1px solid #333;
+		padding-bottom: 12px;
+	}
+
+	.modal-header h2 {
+		color: #ff9500;
+		font-size: 16px;
+		font-weight: bold;
+		letter-spacing: 1px;
+		margin: 0;
+	}
+
+	.modal-close {
+		background: none;
+		border: none;
+		color: #666;
+		font-size: 24px;
+		cursor: pointer;
+		line-height: 1;
+		padding: 0 4px;
+		transition: color 0.2s;
+	}
+
+	.modal-close:hover {
+		color: #ff9500;
+	}
+
+	.modal-trade-summary {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+		align-items: center;
+		margin-bottom: 16px;
+		padding: 12px;
+		background: #000;
+		border: 1px solid #222;
+		font-size: 12px;
+	}
+
+	.trade-badge {
+		padding: 2px 8px;
+		background: #1a1a1a;
+		border: 1px solid #333;
+		color: #fff;
+	}
+
+	.trade-badge.long {
+		color: #00ff00;
+		border-color: #00ff00;
+	}
+
+	.trade-badge.short {
+		color: #ff4444;
+		border-color: #ff4444;
+	}
+
+	.modal-label {
+		display: block;
+		color: #666;
+		font-size: 11px;
+		margin-bottom: 8px;
+		letter-spacing: 1px;
+	}
+
+	.modal-textarea {
+		width: 100%;
+		background: #000;
+		border: 1px solid #333;
+		color: #fff;
+		padding: 12px;
+		font-family: 'Courier New', monospace;
+		font-size: 12px;
+		margin-bottom: 20px;
+		resize: vertical;
+		min-height: 80px;
+		box-sizing: border-box;
+	}
+
+	.modal-textarea::placeholder {
+		color: #555;
+	}
+
+	.modal-textarea:focus {
+		outline: none;
+		border-color: #ff9500;
+	}
+
+	.modal-actions {
+		display: flex;
+		gap: 12px;
+		justify-content: flex-end;
+	}
+
+	.modal-btn {
+		padding: 10px 20px;
+		font-size: 12px;
+		font-weight: bold;
+		letter-spacing: 1px;
+		cursor: pointer;
+		font-family: 'Courier New', monospace;
+		border: 1px solid #333;
+		transition: all 0.2s ease;
+	}
+
+	.modal-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.modal-btn.cancel {
+		background: #1a1a1a;
+		color: #666;
+	}
+
+	.modal-btn.cancel:hover:not(:disabled) {
+		color: #fff;
+		border-color: #555;
+	}
+
+	.modal-btn.primary {
+		background: #ff9500;
+		color: #000;
+		border-color: #ff9500;
+	}
+
+	.modal-btn.primary:hover:not(:disabled) {
+		background: #ffaa33;
+		border-color: #ffaa33;
 	}
 
 	.table-row .status {
