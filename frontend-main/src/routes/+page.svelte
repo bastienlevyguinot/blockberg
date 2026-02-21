@@ -4,6 +4,8 @@
 	import { magicBlockClient, PositionDirection, TRADING_PAIRS } from '$lib/magicblock';
 	import { walletStore } from '$lib/wallet/stores';
 	import WalletButton from '$lib/wallet/WalletButton.svelte';
+	import Toast from '$lib/toast/Toast.svelte';
+	import { toastStore } from '$lib/toast/store';
 
 	const hermesClient = new HermesClient('https://hermes.pyth.network', {});
 
@@ -25,6 +27,7 @@
 	};
 
 	let news: any[] = [];
+	let businessNews: any[] = [];
 	let prices: Record<string, PriceData> = {
 		SOL: { price: 0, change: 0, confidence: 0, emaPrice: 0, publishTime: 0, spread: 0 },
 		BTC: { price: 0, change: 0, confidence: 0, emaPrice: 0, publishTime: 0, spread: 0 },
@@ -237,6 +240,31 @@
 			news = [];
 		} finally {
 			newsLoading = false;
+		}
+	}
+
+	async function fetchBusinessNews() {
+		try {
+			const rssUrl = 'https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en';
+			const response = await fetch(`https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(rssUrl)}`);
+
+			if (!response.ok) {
+				throw new Error(`HTTP ${response.status}`);
+			}
+
+			const data = await response.json();
+
+			if (data.items && data.items.length > 0) {
+				businessNews = data.items.map((item: any) => ({
+					title: item.title,
+					url: item.link,
+					imageurl: item.enclosure?.link || item.thumbnail || null,
+					source: item.author || 'Google News'
+				}));
+			}
+		} catch (error) {
+			console.error('Failed to fetch business news:', error);
+			businessNews = [];
 		}
 	}
 
@@ -454,6 +482,12 @@
 
 				magicBlockStatus = `${action} complete`;
 
+				// Show success toast
+				toastStore.success(
+					`${action} Order Executed`,
+					`Successfully ${action === 'BUY' ? 'bought' : 'sold'} ${tokenAmount} ${selectedTab} at $${currentPrice.toFixed(2)}`
+				);
+
 				// Immediate refresh
 				await updateWalletStatus();
 				updateAvailableBalance();
@@ -466,6 +500,10 @@
 			} catch (error: any) {
 				console.error('Trade error:', error);
 				magicBlockStatus = `${action} failed`;
+
+				// Show error toast with the actual error message
+				const errorMessage = error.message || 'Transaction failed. Please try again.';
+				toastStore.error(`${action} Failed`, errorMessage);
 				return;
 			}
 		}
@@ -511,6 +549,13 @@
 
 				magicBlockStatus = 'Position opened';
 
+				// Show success toast
+				const tpSlInfo = tp || sl ? ` (TP: ${tp ? `$${tp}` : 'N/A'}, SL: ${sl ? `$${sl}` : 'N/A'})` : '';
+				toastStore.success(
+					`${direction} Position Opened`,
+					`Opened ${direction} position on ${selectedTab} - Size: $${tokenAmount} at $${currentPrice.toFixed(2)}${tpSlInfo}`
+				);
+
 				// Immediate refresh
 				await updateWalletStatus();
 				updateAvailableBalance();
@@ -523,6 +568,10 @@
 			} catch (error: any) {
 				console.error('Position error:', error);
 				magicBlockStatus = 'Open failed';
+
+				// Show error toast with the actual error message
+				const errorMessage = error.message || 'Failed to open position. Please try again.';
+				toastStore.error(`${direction} Position Failed`, errorMessage);
 				return;
 			}
 		}
@@ -557,11 +606,11 @@
 		if (isOnChainMode && connectedWallet?.connected) {
 			try {
 				magicBlockStatus = 'Closing position on-chain...';
-				
+
 				// Check if this is a direct contract position (has pubkey) or traditional position
 				const onChainPos = onChainPositions.find(p => p.pubkey === id);
 				let txSig: string;
-				
+
 				if (onChainPos) {
 					// This is a direct contract position - use closeDirectPosition
 					const currentPrice = prices[onChainPos.pairSymbol]?.price || onChainPos.entryPrice;
@@ -570,19 +619,31 @@
 					// This is a traditional MagicBlock/Bolt position
 					txSig = await magicBlockClient.closePosition(id.toString());
 				}
-				
+
 				magicBlockStatus = `Position closed: ${txSig.substring(0, 8)}...`;
-				
+
+				// Show success toast
+				if (onChainPos) {
+					const pnlDisplay = onChainPos.pnl >= 0 ? `+$${onChainPos.pnl.toFixed(2)}` : `-$${Math.abs(onChainPos.pnl).toFixed(2)}`;
+					toastStore.success(
+						'Position Closed',
+						`Closed ${onChainPos.direction} ${onChainPos.pairSymbol} position. P&L: ${pnlDisplay}`
+					);
+				} else {
+					toastStore.success('Position Closed', 'Your position has been closed successfully.');
+				}
+
 				// Refresh positions immediately and again after a delay
 				await fetchOnChainPositions();
 				setTimeout(async () => {
 					await fetchOnChainPositions();
 				}, 1000);
-				
+
 			} catch (error: any) {
 				if (error.message?.includes('This transaction has already been processed') ||
 					error.message?.includes('Transaction already processed')) {
 					magicBlockStatus = 'Position closed';
+					toastStore.success('Position Closed', 'Your position has been closed successfully.');
 
 					await fetchOnChainPositions();
 					setTimeout(async () => {
@@ -590,6 +651,8 @@
 					}, 1000);
 				} else {
 					magicBlockStatus = 'Close failed';
+					const errorMessage = error.message || 'Failed to close position. Please try again.';
+					toastStore.error('Close Position Failed', errorMessage);
 				}
 			}
 		}
@@ -698,6 +761,7 @@
 
 		initializeWallet();
 		fetchNews();
+		fetchBusinessNews();
 		startPythPriceUpdates();
 		updateTime();
 
@@ -766,11 +830,6 @@
 		<div class="wallet-section">
 			<WalletButton />
 		</div>
-		<div class="competition-timer">
-			<span class="timer-label">ROUND ENDS:</span>
-			<span class="timer-value">{timeRemaining}</span>
-		</div>
-		<div class="clock">{currentTime}</div>
 	</div>
 
 	<div class="ticker-bar">
@@ -817,27 +876,41 @@
 		<button class="tab" class:active={selectedTab === 'ETH'} on:click={() => switchTab('ETH')}>ETH EQUITY</button>
 		<button class="tab" class:active={selectedTab === 'AVAX'} on:click={() => switchTab('AVAX')}>AVAX EQUITY</button>
 		<button class="tab" class:active={selectedTab === 'LINK'} on:click={() => switchTab('LINK')}>LINK EQUITY</button>
-		<button class="tab">NEWS</button>
-		<button class="tab">LEADERBOARD</button>
+		<div class="news-ticker-container">
+			<div class="news-ticker">
+				{#if businessNews.length > 0}
+					{#each [...businessNews, ...businessNews] as article, i}
+						<a href={article.url} target="_blank" rel="noopener noreferrer" class="ticker-news-item">
+							{#if article.imageurl}
+								<img src={article.imageurl} alt="" class="ticker-news-img" />
+							{/if}
+							<span class="ticker-news-text">{article.title}</span>
+						</a>
+					{/each}
+				{:else}
+					<span class="ticker-loading">Loading business news...</span>
+				{/if}
+			</div>
+		</div>
 	</div>
 
 	<div class="main-grid">
 		<div class="panel news-panel">
 			<div class="panel-header">
 				TOP NEWS - CRYPTO
-				{#if !newsLoading && news.length > 7}
+				{#if !newsLoading && news.length > 5}
 					<span class="news-toggle" on:click={() => showAllNews = !showAllNews}>
 						{showAllNews ? '▲ COLLAPSE' : '▼ SHOW ALL'}
 					</span>
 				{/if}
 			</div>
-			<div class="news-list">
+			<div class="news-list" class:expanded={showAllNews}>
 				{#if newsLoading}
 					<div class="loading-state">Loading news from CryptoCompare API...</div>
 				{:else if news.length === 0}
 					<div class="error-state">Failed to load news. Check console for details.</div>
 				{:else}
-					{@const displayedNews = showAllNews ? news : news.slice(0, 7)}
+					{@const displayedNews = showAllNews ? news : news.slice(0, 5)}
 					{#each displayedNews as article, i}
 						<a href={article.url} target="_blank" rel="noopener noreferrer" class="news-item">
 							<div class="news-meta">
@@ -848,14 +921,14 @@
 							<div class="news-title">{article.title}</div>
 						</a>
 					{/each}
-					{#if !showAllNews && news.length > 7}
+					{#if !showAllNews && news.length > 5}
 						<div class="news-more">
 							<button class="show-more-btn" on:click={() => showAllNews = true}>
-								Show {news.length - 7} more articles ▼
+								Show {news.length - 5} more articles ▼
 							</button>
 						</div>
 					{/if}
-					{#if showAllNews && news.length > 7}
+					{#if showAllNews && news.length > 5}
 						<div class="news-more">
 							<button class="show-more-btn" on:click={() => showAllNews = false}>
 								▲ Show less
@@ -902,232 +975,7 @@
 				></iframe>
 			</div>
 
-			<div class="trading-panel-below">
-				<!-- Balance Display -->
-				<div class="balance-display">
-					<div class="balance-item">
-						<span class="balance-label">USDT:</span>
-						<span class="balance-value">{availableBalance.tokenIn.toFixed(2)}</span>
-					</div>
-					<div class="balance-item">
-						<span class="balance-label">{selectedTab}:</span>
-						<span class="balance-value">{availableBalance.tokenOut.toFixed(4)}</span>
-					</div>
-				</div>
-
-				<!-- Main Trading Sections -->
-				<div class="trading-sections">
-					<!-- BUY/LONG Section -->
-					<div class="trading-section buy-section">
-						<div class="section-header">
-							<div class="section-title">BUY / LONG</div>
-							<div class="section-price">@${prices[selectedTab].price.toFixed(2)}</div>
-						</div>
-						<div class="section-buttons">
-							<button 
-								class="action-btn buy-btn" 
-								class:active={activeTradingPanel === 'buy'}
-								on:click={() => openTradingPanel('buy')}
-								disabled={!connectedWallet?.connected}
-							>
-								<div class="btn-text">BUY SPOT</div>
-							</button>
-							<button 
-								class="action-btn long-btn" 
-								class:active={activeTradingPanel === 'long'}
-								on:click={() => openTradingPanel('long')}
-								disabled={!connectedWallet?.connected}
-							>
-								<div class="btn-text">LONG</div>
-							</button>
-						</div>
-					</div>
-
-					<!-- SELL/SHORT Section -->
-					<div class="trading-section sell-section">
-						<div class="section-header">
-							<div class="section-title">SELL / SHORT</div>
-							<div class="section-price">@${prices[selectedTab].price.toFixed(2)}</div>
-						</div>
-						<div class="section-buttons">
-							<button 
-								class="action-btn sell-btn" 
-								class:active={activeTradingPanel === 'sell'}
-								on:click={() => openTradingPanel('sell')}
-								disabled={!connectedWallet?.connected}
-							>
-								<div class="btn-text">SELL SPOT</div>
-							</button>
-							<button 
-								class="action-btn short-btn" 
-								class:active={activeTradingPanel === 'short'}
-								on:click={() => openTradingPanel('short')}
-								disabled={!connectedWallet?.connected}
-							>
-								<div class="btn-text">SHORT</div>
-							</button>
-						</div>
-					</div>
-				</div>
-
-				<!-- Expandable Trading Controls -->
-				{#if activeTradingPanel}
-					<div class="trading-controls-panel" class:visible={activeTradingPanel}>
-						<div class="controls-header">
-							<div class="controls-title">
-								{activeTradingPanel.toUpperCase()} {selectedTab}/USDT
-							</div>
-							<button class="close-panel-btn" on:click={closeTradingPanel}>✕</button>
-						</div>
-
-
-						<!-- Trading Mode Toggle -->
-						<div class="trading-mode-toggle">
-							<button 
-								class="mode-toggle-btn" 
-								class:active={tradingMode === 'manual'}
-								on:click={resetToManualMode}
-							>
-								MANUAL
-							</button>
-							<button 
-								class="mode-toggle-btn" 
-								class:active={tradingMode === 'percentage'}
-								on:click={() => tradingMode = 'percentage'}
-							>
-								PERCENTAGE
-							</button>
-						</div>
-
-						<!-- Percentage Controls -->
-						{#if tradingMode === 'percentage'}
-							<div class="percentage-controls-advanced">
-								<div class="percentage-label">SELECT AMOUNT:</div>
-								<div class="percentage-buttons-grid">
-									<button 
-										class="percentage-btn-advanced" 
-										class:active={selectedPercentage === 25}
-										on:click={() => setPercentageSize(25, activeTradingPanel)}
-									>
-										25%
-									</button>
-									<button 
-										class="percentage-btn-advanced" 
-										class:active={selectedPercentage === 50}
-										on:click={() => setPercentageSize(50, activeTradingPanel)}
-									>
-										50%
-									</button>
-									<button 
-										class="percentage-btn-advanced" 
-										class:active={selectedPercentage === 75}
-										on:click={() => setPercentageSize(75, activeTradingPanel)}
-									>
-										75%
-									</button>
-									<button 
-										class="percentage-btn-advanced" 
-										class:active={selectedPercentage === 100}
-										on:click={() => setPercentageSize(100, activeTradingPanel)}
-									>
-										100%
-									</button>
-								</div>
-							</div>
-						{/if}
-
-						<!-- Input Controls -->
-						<div class="input-controls-grid">
-							<div class="input-control">
-								<label class="input-label">SIZE</label>
-								<input 
-									type="number" 
-									class="trading-input" 
-									value={currentSize}
-									on:input={(e) => updateCurrentSize(e.target.value)}
-									placeholder="0.00"
-								/>
-								<div class="input-suffix">{activeTradingPanel === 'buy' || activeTradingPanel === 'long' ? selectedTab : selectedTab}</div>
-							</div>
-							{#if activeTradingPanel === 'long' || activeTradingPanel === 'short'}
-								<div class="input-control">
-									<label class="input-label">TAKE PROFIT</label>
-									<input 
-										type="number" 
-										class="trading-input" 
-										bind:value={takeProfit}
-										placeholder="0.00"
-									/>
-									<div class="input-suffix">USDT</div>
-								</div>
-								<div class="input-control">
-									<label class="input-label">STOP LOSS</label>
-									<input 
-										type="number" 
-										class="trading-input" 
-										bind:value={stopLoss}
-										placeholder="0.00"
-									/>
-									<div class="input-suffix">USDT</div>
-								</div>
-							{/if}
-						</div>
-
-						<!-- Execute Button -->
-						<div class="execute-section">
-							<div class="trade-summary">
-								<div class="summary-row">
-									<span>Available:</span>
-									<span class="summary-value">
-										{activeTradingPanel === 'buy' || activeTradingPanel === 'long' 
-											? availableBalance.tokenIn.toFixed(2) + ' USDT'
-											: availableBalance.tokenOut.toFixed(4) + ' ' + selectedTab
-										}
-									</span>
-								</div>
-								{#if currentSize}
-									<div class="summary-row">
-										<span>Est. Cost:</span>
-										<span class="summary-value">
-											{prices[selectedTab].price > 0 
-												? ((parseFloat(currentSize) || 0) * prices[selectedTab].price).toFixed(2) + ' USDT'
-												: 'Loading...'
-											}
-										</span>
-									</div>
-									<div class="summary-row">
-										<span>You will {activeTradingPanel === 'buy' || activeTradingPanel === 'long' ? 'receive' : 'sell'}:</span>
-										<span class="summary-value">
-											{prices[selectedTab].price > 0 && currentSize
-												? (parseFloat(currentSize) || 0).toFixed(4) + ' ' + selectedTab
-												: 'Loading...'
-											}
-										</span>
-									</div>
-								{/if}
-							</div>
-							<button 
-								class="execute-btn"
-								class:buy-execute={activeTradingPanel === 'buy' || activeTradingPanel === 'long'}
-								class:sell-execute={activeTradingPanel === 'sell' || activeTradingPanel === 'short'}
-								on:click={() => {
-									if (activeTradingPanel === 'buy') executeSpotTrade('BUY');
-									else if (activeTradingPanel === 'sell') executeSpotTrade('SELL');
-									else if (activeTradingPanel === 'long') openPosition('LONG');
-									else if (activeTradingPanel === 'short') openPosition('SHORT');
-								}}
-								disabled={!connectedWallet?.connected || 
-									!currentSize ||
-									parseFloat(currentSize) <= 0
-								}
-							>
-								{activeTradingPanel.toUpperCase()} {selectedTab}
-							</button>
-						</div>
-					</div>
-				{/if}
-			</div>
-
+	
 			{#if onChainPositions.length > 0}
 				<div class="positions-panel">
 					<div class="positions-header">
@@ -1243,36 +1091,251 @@
 					<div class="no-wallet-message">Connect wallet to view mock token balances</div>
 				</div>
 			{/if}
-			
-			<div class="leaderboard-section">
-				<div class="panel-subheader">
-					COMPETITION LEADERBOARD
-					<span class="leaderboard-stats">
-						<span>WIN RATE: {totalTrades > 0 ? ((winningTrades / totalTrades) * 100).toFixed(1) : 0}%</span>
-					</span>
-				</div>
-				<div class="leaderboard-table">
-					<div class="table-header">
-						<span>RANK</span>
-						<span>TRADER</span>
-						<span>P&L</span>
-						<span>TRADES</span>
-					</div>
-					{#each leaderboardData as leader}
-						<div class="leader-row" class:highlight={leader.address === 'YOU (Paper)'}>
-							<span class="rank">{leader.rank}</span>
-							<span class="address">{leader.address}</span>
-							<span class={leader.pnl >= 0 ? 'pnl-up' : 'pnl-down'}>
-								{leader.pnl >= 0 ? '+' : ''}${leader.pnl.toFixed(2)}
-							</span>
-							<span>{leader.trades}</span>
+
+			<!-- Trading Panel -->
+			<div class="trading-panel-right">
+				{#if !activeTradingPanel}
+					<!-- Main Trading Buttons View -->
+					<div class="panel-subheader">TRADE {selectedTab}/USDT</div>
+					<div class="trading-sections">
+						<!-- BUY/LONG Section -->
+						<div class="trading-section buy-section">
+							<div class="section-header">
+								<div class="section-title">BUY / LONG</div>
+								<div class="section-price">@${prices[selectedTab].price.toFixed(2)}</div>
+							</div>
+							<div class="section-buttons">
+								<button
+									class="action-btn buy-btn"
+									on:click={() => openTradingPanel('buy')}
+									disabled={!connectedWallet?.connected}
+								>
+									<div class="btn-text">BUY SPOT</div>
+								</button>
+								<button
+									class="action-btn long-btn"
+									on:click={() => openTradingPanel('long')}
+									disabled={!connectedWallet?.connected}
+								>
+									<div class="btn-text">LONG</div>
+								</button>
+							</div>
 						</div>
-					{/each}
-				</div>
+
+						<!-- SELL/SHORT Section -->
+						<div class="trading-section sell-section">
+							<div class="section-header">
+								<div class="section-title">SELL / SHORT</div>
+								<div class="section-price">@${prices[selectedTab].price.toFixed(2)}</div>
+							</div>
+							<div class="section-buttons">
+								<button
+									class="action-btn sell-btn"
+									on:click={() => openTradingPanel('sell')}
+									disabled={!connectedWallet?.connected}
+								>
+									<div class="btn-text">SELL SPOT</div>
+								</button>
+								<button
+									class="action-btn short-btn"
+									on:click={() => openTradingPanel('short')}
+									disabled={!connectedWallet?.connected}
+								>
+									<div class="btn-text">SHORT</div>
+								</button>
+							</div>
+						</div>
+
+						<!-- Quick Stats -->
+						<div class="trading-quick-stats">
+							<div class="quick-stat">
+								<span class="stat-label">24h Change</span>
+								<span class={prices[selectedTab].change >= 0 ? 'stat-value-up' : 'stat-value-down'}>
+									{prices[selectedTab].change >= 0 ? '+' : ''}{prices[selectedTab].change.toFixed(2)}%
+								</span>
+							</div>
+							<div class="quick-stat">
+								<span class="stat-label">EMA Price</span>
+								<span class="stat-value">${prices[selectedTab].emaPrice.toFixed(2)}</span>
+							</div>
+							<div class="quick-stat">
+								<span class="stat-label">Confidence</span>
+								<span class="stat-value">±{prices[selectedTab].spread.toFixed(3)}%</span>
+							</div>
+						</div>
+					</div>
+				{:else}
+					<!-- Trading Form View (replaces buttons) -->
+					<div class="panel-subheader trading-form-header">
+						<button class="back-btn" on:click={closeTradingPanel}>
+							<span class="back-arrow">←</span>
+						</button>
+						<span class="form-title"
+							class:buy-title={activeTradingPanel === 'buy' || activeTradingPanel === 'long'}
+							class:sell-title={activeTradingPanel === 'sell' || activeTradingPanel === 'short'}
+						>
+							{activeTradingPanel.toUpperCase()} {selectedTab}/USDT
+						</span>
+						<span class="form-price">@${prices[selectedTab].price.toFixed(2)}</span>
+					</div>
+
+					<div class="trading-form-content">
+						<!-- Trading Mode Toggle -->
+						<div class="trading-mode-toggle">
+							<button
+								class="mode-toggle-btn"
+								class:active={tradingMode === 'manual'}
+								on:click={resetToManualMode}
+							>
+								MANUAL
+							</button>
+							<button
+								class="mode-toggle-btn"
+								class:active={tradingMode === 'percentage'}
+								on:click={() => tradingMode = 'percentage'}
+							>
+								PERCENTAGE
+							</button>
+						</div>
+
+						<!-- Percentage Controls -->
+						{#if tradingMode === 'percentage'}
+							<div class="percentage-buttons-grid">
+								<button
+									class="percentage-btn-advanced"
+									class:active={selectedPercentage === 25}
+									on:click={() => setPercentageSize(25, activeTradingPanel)}
+								>
+									25%
+								</button>
+								<button
+									class="percentage-btn-advanced"
+									class:active={selectedPercentage === 50}
+									on:click={() => setPercentageSize(50, activeTradingPanel)}
+								>
+									50%
+								</button>
+								<button
+									class="percentage-btn-advanced"
+									class:active={selectedPercentage === 75}
+									on:click={() => setPercentageSize(75, activeTradingPanel)}
+								>
+									75%
+								</button>
+								<button
+									class="percentage-btn-advanced"
+									class:active={selectedPercentage === 100}
+									on:click={() => setPercentageSize(100, activeTradingPanel)}
+								>
+									100%
+								</button>
+							</div>
+						{/if}
+
+						<!-- Input Controls -->
+						<div class="input-controls-grid">
+							<div class="input-control">
+								<label class="input-label">SIZE ({selectedTab})</label>
+								<input
+									type="number"
+									class="trading-input"
+									value={currentSize}
+									on:input={(e) => updateCurrentSize(e.target.value)}
+									placeholder="0.00"
+								/>
+							</div>
+							{#if activeTradingPanel === 'long' || activeTradingPanel === 'short'}
+								<div class="input-control">
+									<label class="input-label">TAKE PROFIT (USDT)</label>
+									<input
+										type="number"
+										class="trading-input"
+										bind:value={takeProfit}
+										placeholder="0.00"
+									/>
+								</div>
+								<div class="input-control">
+									<label class="input-label">STOP LOSS (USDT)</label>
+									<input
+										type="number"
+										class="trading-input"
+										bind:value={stopLoss}
+										placeholder="0.00"
+									/>
+								</div>
+							{/if}
+						</div>
+
+						<!-- Trade Summary -->
+						<div class="trade-summary">
+							<div class="summary-row">
+								<span>Available:</span>
+								<span class="summary-value">
+									{activeTradingPanel === 'buy' || activeTradingPanel === 'long'
+										? availableBalance.tokenIn.toFixed(2) + ' USDT'
+										: availableBalance.tokenOut.toFixed(4) + ' ' + selectedTab
+									}
+								</span>
+							</div>
+							{#if currentSize}
+								<div class="summary-row">
+									<span>Est. Cost:</span>
+									<span class="summary-value">
+										{prices[selectedTab].price > 0
+											? ((parseFloat(currentSize) || 0) * prices[selectedTab].price).toFixed(2) + ' USDT'
+											: 'Loading...'
+										}
+									</span>
+								</div>
+							{/if}
+						</div>
+
+						<!-- Execute Button -->
+						<button
+							class="execute-btn"
+							class:buy-execute={activeTradingPanel === 'buy' || activeTradingPanel === 'long'}
+							class:sell-execute={activeTradingPanel === 'sell' || activeTradingPanel === 'short'}
+							on:click={() => {
+								if (activeTradingPanel === 'buy') executeSpotTrade('BUY');
+								else if (activeTradingPanel === 'sell') executeSpotTrade('SELL');
+								else if (activeTradingPanel === 'long') openPosition('LONG');
+								else if (activeTradingPanel === 'short') openPosition('SHORT');
+							}}
+							disabled={!connectedWallet?.connected ||
+								!currentSize ||
+								parseFloat(currentSize) <= 0
+							}
+						>
+							{activeTradingPanel.toUpperCase()} {selectedTab}
+						</button>
+					</div>
+				{/if}
 			</div>
 		</div>
 	</div>
+
+	<footer class="footer">
+		<div class="footer-content">
+			<div class="footer-left">
+				<span class="footer-brand">BLOCKBERG</span>
+				<span class="footer-tagline">Paper Trading Terminal</span>
+			</div>
+			<div class="footer-center">
+				<span class="footer-powered">Powered by</span>
+				<a href="https://pyth.network" target="_blank" rel="noopener noreferrer" class="footer-link">Pyth Network</a>
+				<span class="footer-separator">•</span>
+				<a href="https://magicblock.gg" target="_blank" rel="noopener noreferrer" class="footer-link">MagicBlock</a>
+				<span class="footer-separator">•</span>
+				<a href="https://solana.com" target="_blank" rel="noopener noreferrer" class="footer-link">Solana</a>
+			</div>
+			<div class="footer-right">
+				<span class="footer-copyright">© 2026 Blockberg. All rights reserved.</span>
+			</div>
+		</div>
+	</footer>
 </div>
+
+<Toast />
 
 <style>
 	:global(body) {
@@ -1281,14 +1344,18 @@
 		background: #000;
 		color: #ff9500;
 		font-family: 'Courier New', 'Lucida Console', monospace;
-		overflow: auto;
+		overflow-x: hidden;
+	}
+
+	:global(html) {
+		background: #000;
 	}
 
 	.bloomberg {
-		min-height: 100vh;
 		background: #000;
 		display: flex;
 		flex-direction: column;
+		overflow-x: hidden;
 	}
 
 	.command-bar {
@@ -1299,7 +1366,7 @@
 		gap: 10px;
 		border-bottom: 1px solid #333;
 		flex-wrap: nowrap;
-		overflow-x: auto;
+		overflow: hidden;
 		min-height: 50px;
 	}
 
@@ -1577,15 +1644,76 @@
 		background: #000;
 	}
 
-	.main-grid {
-		display: grid;
-		grid-template-columns: 320px 1fr 280px;
-		gap: 2px;
-		background: #111;
+	/* News Ticker */
+	.news-ticker-container {
 		flex: 1;
 		overflow: hidden;
-		min-height: 0;
-		align-items: start;
+		position: relative;
+		background: #0a0a0a;
+		border-left: 1px solid #333;
+	}
+
+	.news-ticker {
+		display: flex;
+		align-items: center;
+		gap: 40px;
+		animation: ticker-scroll 8s linear infinite;
+		white-space: nowrap;
+		padding: 0 20px;
+		height: 100%;
+	}
+
+	@keyframes ticker-scroll {
+		0% {
+			transform: translateX(0);
+		}
+		100% {
+			transform: translateX(-50%);
+		}
+	}
+
+	.ticker-news-item {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		text-decoration: none;
+		color: #ccc;
+		font-size: 11px;
+		transition: color 0.2s ease;
+		flex-shrink: 0;
+	}
+
+	.ticker-news-item:hover {
+		color: #ff9500;
+	}
+
+	.ticker-news-img {
+		width: 24px;
+		height: 24px;
+		object-fit: cover;
+		border-radius: 3px;
+		flex-shrink: 0;
+	}
+
+	.ticker-news-text {
+		max-width: 300px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.ticker-loading {
+		color: #666;
+		font-size: 11px;
+	}
+
+	.main-grid {
+		display: grid;
+		grid-template-columns: 280px 1fr 340px;
+		gap: 2px;
+		background: #000;
+		overflow: hidden;
+		align-items: stretch;
 	}
 
 	.panel {
@@ -1596,8 +1724,23 @@
 	}
 
 	.news-panel {
-		height: 650px;
-		max-height: 650px;
+		display: flex;
+		flex-direction: column;
+		height: 485px;
+	}
+
+	.chart-panel {
+		display: flex;
+		flex-direction: column;
+		height: 485px;
+	}
+
+	.leaderboard-panel {
+		display: flex;
+		flex-direction: column;
+		overflow-x: hidden;
+		overflow-y: hidden;
+		height: 485px;
 	}
 
 	.panel-header {
@@ -1614,11 +1757,13 @@
 	}
 
 	.news-list {
-		overflow-y: auto;
 		padding: 10px;
 		flex: 1;
-		height: 100%;
-		max-height: calc(100vh - 20px);
+		overflow: hidden;
+	}
+
+	.news-list.expanded {
+		overflow-y: auto;
 	}
 
 	.loading-state,
@@ -1712,7 +1857,7 @@
 
 	.chart-container {
 		background: #0a0a0a;
-		height: 400px;
+		flex: 1;
 		width: 100%;
 	}
 
@@ -1757,11 +1902,138 @@
 		text-align: right;
 	}
 
+	/* Trading Panel Right */
+	.trading-panel-right {
+		border-top: 1px solid #333;
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		overflow-x: hidden;
+		overflow-y: hidden;
+	}
+
+	.trading-panel-right .panel-subheader {
+		padding: 8px 12px;
+		flex-shrink: 0;
+	}
+
+	/* Trading Form Header with Back Button */
+	.trading-form-header {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+	}
+
+	.back-btn {
+		background: none;
+		border: 1px solid #444;
+		color: #ff9500;
+		width: 28px;
+		height: 28px;
+		border-radius: 4px;
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		transition: all 0.2s ease;
+		flex-shrink: 0;
+	}
+
+	.back-btn:hover {
+		background: #222;
+		border-color: #ff9500;
+	}
+
+	.back-arrow {
+		font-size: 16px;
+		font-weight: bold;
+	}
+
+	.form-title {
+		flex: 1;
+		font-weight: bold;
+		letter-spacing: 1px;
+	}
+
+	.form-title.buy-title {
+		color: #00ff00;
+	}
+
+	.form-title.sell-title {
+		color: #ff4444;
+	}
+
+	.form-price {
+		color: #fff;
+		font-family: 'Courier New', monospace;
+		font-size: 11px;
+	}
+
+	.trading-form-content {
+		padding: 12px;
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+		overflow-x: hidden;
+		overflow-y: auto;
+		flex: 1;
+	}
+
 	/* Trading Sections */
 	.trading-sections {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 15px;
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+		padding: 12px;
+		overflow-x: hidden;
+		overflow-y: auto;
+		flex: 1;
+	}
+
+	.trading-quick-stats {
+		background: #0a0a0a;
+		border: 1px solid #333;
+		border-radius: 6px;
+		padding: 12px;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		margin-top: auto;
+	}
+
+	.quick-stat {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		padding: 4px 0;
+		border-bottom: 1px solid #222;
+	}
+
+	.quick-stat:last-child {
+		border-bottom: none;
+	}
+
+	.quick-stat .stat-label {
+		color: #666;
+		font-size: 11px;
+	}
+
+	.quick-stat .stat-value {
+		color: #fff;
+		font-size: 11px;
+		font-family: 'Courier New', monospace;
+	}
+
+	.quick-stat .stat-value-up {
+		color: #00ff00;
+		font-size: 11px;
+		font-family: 'Courier New', monospace;
+	}
+
+	.quick-stat .stat-value-down {
+		color: #ff4444;
+		font-size: 11px;
+		font-family: 'Courier New', monospace;
 	}
 
 	.trading-section {
@@ -1809,8 +2081,8 @@
 	}
 
 	.section-buttons {
-		display: flex;
-		flex-direction: column;
+		display: grid;
+		grid-template-columns: 1fr 1fr;
 		gap: 8px;
 	}
 
@@ -2073,9 +2345,9 @@
 
 	/* Input Controls */
 	.input-controls-grid {
-		display: grid;
-		grid-template-columns: repeat(2, 1fr);
-		gap: 12px;
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
 		margin-bottom: 15px;
 	}
 
@@ -2259,7 +2531,6 @@
 		background: #000;
 		border-top: 1px solid #333;
 		padding: 8px;
-		max-height: 300px;
 		overflow-y: auto;
 		overflow-x: hidden;
 	}
@@ -2531,8 +2802,6 @@
 
 	.token-balances {
 		padding: 10px;
-		max-height: 200px;
-		overflow-y: auto;
 		flex-shrink: 0;
 	}
 
@@ -2675,5 +2944,74 @@
 		font-size: 10px;
 		font-style: italic;
 		line-height: 1.4;
+	}
+
+	/* Footer */
+	.footer {
+		background: #0a0a0a;
+		border-top: 1px solid #333;
+		padding: 12px 20px;
+	}
+
+	.footer-content {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		max-width: 100%;
+	}
+
+	.footer-left {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+	}
+
+	.footer-brand {
+		color: #ff9500;
+		font-weight: bold;
+		font-size: 14px;
+		letter-spacing: 2px;
+	}
+
+	.footer-tagline {
+		color: #666;
+		font-size: 11px;
+	}
+
+	.footer-center {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.footer-powered {
+		color: #666;
+		font-size: 11px;
+	}
+
+	.footer-link {
+		color: #ff9500;
+		text-decoration: none;
+		font-size: 11px;
+		transition: color 0.2s ease;
+	}
+
+	.footer-link:hover {
+		color: #fff;
+	}
+
+	.footer-separator {
+		color: #444;
+		font-size: 10px;
+	}
+
+	.footer-right {
+		display: flex;
+		align-items: center;
+	}
+
+	.footer-copyright {
+		color: #444;
+		font-size: 10px;
 	}
 </style>
