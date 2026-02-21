@@ -14,16 +14,30 @@
 	let leaderboard: any[] = [];
 	let hasJoined = false;
 
-	// Filter: Past tournaments (Ended or Settled)
-	$: pastTournaments = tournaments.filter(t =>
+	// Tournament IDs to hide from display
+	const HIDDEN_TOURNAMENT_IDS = new Set(['7414763778215203000', '4327537319689978400', '12206805485679546000']);
+
+	// Filter out hidden tournaments
+	$: visibleTournaments = tournaments.filter(t => !HIDDEN_TOURNAMENT_IDS.has(String(t.id)));
+
+	// Active tournaments: Pending or Active, excluding Ended/Settled. Hide Pending if cooldown already passed (0)
+	$: activeTournaments = visibleTournaments.filter(t => {
+		if (t.status === TournamentStatus.Ended || t.status === TournamentStatus.Settled) return false;
+		// Pending with cooldown passed (cooldownEnd <= now) = don't display
+		if (t.status === TournamentStatus.Pending && t.cooldownEnd.getTime() <= Date.now()) return false;
+		return true;
+	});
+
+	// Past tournaments: Ended or Settled only
+	$: pastTournaments = visibleTournaments.filter(t =>
 		t.status === TournamentStatus.Ended || t.status === TournamentStatus.Settled
 	);
 
 	// Debug logging
 	$: if (tournaments.length > 0) {
 		console.log('[TOURNAMENTS] Total:', tournaments.length);
-		console.log('[TOURNAMENTS] Past tournaments:', pastTournaments.length);
-		console.log('[TOURNAMENTS] Statuses:', tournaments.map(t => ({ id: t.id, status: t.status })));
+		console.log('[TOURNAMENTS] Active:', activeTournaments.length);
+		console.log('[TOURNAMENTS] Past:', pastTournaments.length);
 	}
 
 	// Force reactivity for countdown by creating a derived value
@@ -63,6 +77,7 @@
 	let isProcessing = false;
 	let statusMessage = '';
 	let currentTime = Date.now(); // For live countdown updates
+	let showHowItWorks = false;
 
 	// Subscribe to wallet changes
 	walletStore.subscribe(wallet => {
@@ -104,16 +119,22 @@
 		try {
 			tournaments = await magicBlockClient.fetchTournaments();
 
-			// Auto-select first active or pending tournament
-			if (!selectedTournament && tournaments.length > 0) {
-				const activeTournament = tournaments.find(t =>
-					t.status === TournamentStatus.Active || t.status === TournamentStatus.Pending
-				);
-				if (activeTournament) {
-					await selectTournament(activeTournament.id);
-				} else {
-					await selectTournament(tournaments[0].id);
-				}
+			// Filter to active list (exclude hidden, ended/settled, and Pending with cooldown passed)
+			const active = tournaments.filter(t => {
+				if (HIDDEN_TOURNAMENT_IDS.has(String(t.id))) return false;
+				if (t.status === TournamentStatus.Ended || t.status === TournamentStatus.Settled) return false;
+				if (t.status === TournamentStatus.Pending && t.cooldownEnd.getTime() <= Date.now()) return false;
+				return true;
+			});
+			// Auto-select: keep current if still in active list, else select first active/pending
+			const currentStillActive = selectedTournamentId && active.some(t => t.id === selectedTournamentId);
+			if (active.length > 0 && !currentStillActive) {
+				const toSelect = active.find(t => t.status === TournamentStatus.Active || t.status === TournamentStatus.Pending) ||
+					active[0];
+				if (toSelect) await selectTournament(toSelect.id);
+			} else if (active.length === 0) {
+				selectedTournamentId = null;
+				selectedTournament = null;
 			}
 		} catch (error) {
 			console.error('Failed to fetch tournaments:', error);
@@ -415,11 +436,47 @@
 			{/if}
 		</div>
 
+		<!-- How it Works Section -->
+		<div class="how-it-works">
+			<button
+				class="how-it-works-toggle"
+				on:click={() => showHowItWorks = !showHowItWorks}
+				aria-expanded={showHowItWorks}
+			>
+				<span class="toggle-icon">{showHowItWorks ? '▼' : '▶'}</span>
+				HOW TOURNAMENTS WORK
+			</button>
+			{#if showHowItWorks}
+				<div class="how-it-works-content">
+					<div class="how-section">
+						<h4>1. Registration Phase</h4>
+						<p>When a tournament is created, it enters <strong>REGISTRATION</strong> status. During this phase, players can join by clicking "ENTER TOURNAMENT" and paying the entry fee (in SOL). Entry fees go to the prize pool.</p>
+					</div>
+					<div class="how-section">
+						<h4>2. Cooldown Period</h4>
+						<p>The <strong>cooldown</strong> is set when creating a tournament (e.g. 5 minutes or 1 day). It's the waiting period before the tournament can start. The countdown shows "STARTS IN" during registration. No one can start the tournament until the cooldown has fully elapsed.</p>
+					</div>
+					<div class="how-section">
+						<h4>3. Starting the Tournament</h4>
+						<p>Once the cooldown ends, <strong>anyone</strong> (including the creator) can click "START TOURNAMENT (Admin)" to begin. The tournament then moves to <strong>LIVE</strong> status and trading begins. All participants start with $10,000 USDT and can trade SOL, BTC, ETH, AVAX, and LINK.</p>
+					</div>
+					<div class="how-section">
+						<h4>4. Live Trading</h4>
+						<p>During the <strong>LIVE</strong> phase, the countdown shows "ENDS IN". Compete for the highest portfolio value. The leaderboard updates in real time.</p>
+					</div>
+					<div class="how-section">
+						<h4>5. Ending & Prizes</h4>
+						<p>When the duration ends, the tournament automatically closes. Prizes: <strong>1st</strong> 50%, <strong>2nd</strong> 30%, <strong>3rd</strong> 15%, <strong>Treasury</strong> 5%.</p>
+					</div>
+				</div>
+			{/if}
+		</div>
+
 		<!-- Main Grid Layout -->
 		<div class="tournament-grid">
-			<!-- Tournament Cards -->
+			<!-- Tournament Cards (Active & Pending only - Ended/Settled show in Past section) -->
 			<div class="tournaments-section">
-				{#each tournaments as tournament (tournament.id)}
+				{#each activeTournaments as tournament (tournament.id)}
 					<div
 						class="tournament-card"
 						class:selected={selectedTournamentId === tournament.id}
@@ -825,6 +882,71 @@
 	.create-tournament-btn:hover {
 		background: #33ff33;
 		transform: scale(1.05);
+	}
+
+	/* How it Works Section */
+	.how-it-works {
+		margin-bottom: 20px;
+		border: 1px solid #333;
+		background: #0a0a0a;
+	}
+
+	.how-it-works-toggle {
+		width: 100%;
+		padding: 12px 15px;
+		background: transparent;
+		border: none;
+		color: #ff9500;
+		font-size: 12px;
+		font-weight: bold;
+		letter-spacing: 1px;
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		font-family: 'Courier New', monospace;
+		transition: background 0.2s;
+	}
+
+	.how-it-works-toggle:hover {
+		background: #111;
+	}
+
+	.toggle-icon {
+		font-size: 10px;
+		color: #666;
+	}
+
+	.how-it-works-content {
+		padding: 15px 20px 20px;
+		border-top: 1px solid #222;
+	}
+
+	.how-section {
+		margin-bottom: 16px;
+	}
+
+	.how-section:last-child {
+		margin-bottom: 0;
+	}
+
+	.how-section h4 {
+		color: #ff9500;
+		font-size: 11px;
+		font-weight: bold;
+		letter-spacing: 1px;
+		margin: 0 0 8px 0;
+	}
+
+	.how-section p {
+		color: #999;
+		font-size: 11px;
+		line-height: 1.6;
+		margin: 0;
+	}
+
+	.how-section p strong {
+		color: #ccc;
 	}
 
 	.tournament-grid {
