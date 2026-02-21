@@ -2211,6 +2211,49 @@ export class MagicBlockClient {
 		return signature;
 	}
 
+	async endTournament(tournamentId: number): Promise<string> {
+		const currentWallet = this.getCurrentWallet();
+		if (!currentWallet) {
+			throw new Error('Wallet not connected');
+		}
+
+		const [tournamentPDA] = this.getTournamentPDA(tournamentId);
+
+		const methodName = 'global:end_tournament';
+		const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(methodName));
+		const discriminator = new Uint8Array(hash).slice(0, 8);
+
+		const instructionData = Buffer.from(discriminator);
+
+		const instruction = new TransactionInstruction({
+			keys: [
+				{ pubkey: tournamentPDA, isSigner: false, isWritable: true },
+				{ pubkey: currentWallet.publicKey, isSigner: true, isWritable: false }
+			],
+			programId: PAPER_TRADING_PROGRAM_ID,
+			data: instructionData
+		});
+
+		const transaction = new Transaction().add(instruction);
+		const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+		transaction.recentBlockhash = latestBlockhash.blockhash;
+		transaction.feePayer = currentWallet.publicKey;
+
+		const signedTx = await currentWallet.signTransaction!(transaction);
+		const signature = await this.connection.sendRawTransaction(signedTx.serialize(), {
+			skipPreflight: false,
+			preflightCommitment: 'confirmed'
+		});
+
+		await this.connection.confirmTransaction({
+			signature,
+			blockhash: latestBlockhash.blockhash,
+			lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+		}, 'confirmed');
+
+		return signature;
+	}
+
 	// Tournament buy - buy token with USDT balance
 	async tournamentBuy(
 		tournamentId: number,

@@ -14,10 +14,30 @@
 	let leaderboard: any[] = [];
 	let hasJoined = false;
 
-	// Filter for active tournaments with participants
-	$: activeTournaments = tournaments.filter(t =>
-		t.status === TournamentStatus.Active && t.participantCount > 0
+	// Filter: Past tournaments (Ended or Settled)
+	$: pastTournaments = tournaments.filter(t =>
+		t.status === TournamentStatus.Ended || t.status === TournamentStatus.Settled
 	);
+
+	// Debug logging
+	$: if (tournaments.length > 0) {
+		console.log('[TOURNAMENTS] Total:', tournaments.length);
+		console.log('[TOURNAMENTS] Past tournaments:', pastTournaments.length);
+		console.log('[TOURNAMENTS] Statuses:', tournaments.map(t => ({ id: t.id, status: t.status })));
+	}
+
+	// Force reactivity for countdown by creating a derived value
+	$: timeDisplay = selectedTournament ? getTimeRemaining(selectedTournament) : '00:00:00';
+
+	// Trigger update when currentTime changes
+	$: if (currentTime && selectedTournament) {
+		timeDisplay = getTimeRemaining(selectedTournament);
+	}
+
+	// Auto-close tournaments that have passed their end time
+	$: if (currentTime && tournaments.length > 0) {
+		checkAndEndTournaments();
+	}
 
 	// Create tournament modal
 	let showCreateModal = false;
@@ -58,6 +78,28 @@
 		}
 	});
 
+	async function checkAndEndTournaments() {
+		const now = Date.now();
+		const activeTournaments = tournaments.filter(t => t.status === TournamentStatus.Active);
+		for (const tournament of activeTournaments) {
+			// If tournament has passed its end time and is still Active
+			if (now >= tournament.endTime.getTime()) {
+				try {
+					console.log(`[AUTO-CLOSE] Tournament #${tournament.id} has ended, closing...`);
+					const signature = await magicBlockClient.endTournament(tournament.id);
+					console.log(`[AUTO-CLOSE] Tournament #${tournament.id} ended:`, signature);
+					// Refresh tournaments after closing
+					await fetchTournaments();
+					if (selectedTournamentId === tournament.id) {
+						await selectTournament(tournament.id);
+					}
+				} catch (error) {
+					console.error(`[AUTO-CLOSE] Failed to end tournament #${tournament.id}:`, error);
+				}
+			}
+		}
+	}
+
 	async function fetchTournaments() {
 		try {
 			tournaments = await magicBlockClient.fetchTournaments();
@@ -86,9 +128,12 @@
 			if (connectedWallet?.connected) {
 				participantData = await magicBlockClient.fetchTournamentParticipant(tournamentId);
 				hasJoined = participantData !== null;
+				console.log('[TOURNAMENT SELECT] Participant data:', participantData);
+				console.log('[TOURNAMENT SELECT] Has joined:', hasJoined);
 			}
 
 			await fetchTournamentLeaderboard();
+			console.log('[TOURNAMENT SELECT] Leaderboard:', leaderboard);
 		} catch (error) {
 			console.error('Failed to select tournament:', error);
 		}
@@ -275,11 +320,13 @@
 	}
 
 	function getTimeRemaining(tournament: Tournament): string {
+		// Explicitly use currentTime to ensure Svelte tracks this dependency
+		const now = currentTime;
 		const targetTime = tournament.status === TournamentStatus.Pending
 			? tournament.cooldownEnd.getTime()
 			: tournament.endTime.getTime();
 
-		const diff = targetTime - currentTime;
+		const diff = targetTime - now;
 		if (diff <= 0) return '00:00:00';
 
 		const hours = Math.floor(diff / 3600000);
@@ -314,7 +361,7 @@
 
 		const dataInterval = setInterval(async () => {
 			await refreshData();
-		}, 30000);
+		}, 10000); // Refresh every 10 seconds for more frequent updates
 
 		// Update countdown every second
 		const countdownInterval = setInterval(() => {
@@ -342,7 +389,7 @@
 				<span class="status-item {getStatusClass(selectedTournament.status)}">
 					{getStatusText(selectedTournament.status)}
 				</span>
-				<span class="status-item">TIME: {getTimeRemaining(selectedTournament)}</span>
+				<span class="status-item">TIME: {timeDisplay}</span>
 				<span class="status-item">POOL: {selectedTournament.prizePool.toFixed(2)} SOL</span>
 				<span class="status-item">PLAYERS: {selectedTournament.participantCount}</span>
 			{:else}
@@ -372,7 +419,7 @@
 		<div class="tournament-grid">
 			<!-- Tournament Cards -->
 			<div class="tournaments-section">
-				{#each activeTournaments as tournament}
+				{#each tournaments as tournament (tournament.id)}
 					<div
 						class="tournament-card"
 						class:selected={selectedTournamentId === tournament.id}
@@ -402,20 +449,26 @@
 								<span class="stat-value orange">{getTimeRemaining(tournament)}</span>
 							</div>
 						</div>
-						{#if selectedTournamentId === tournament.id && connectedWallet?.connected && !hasJoined && tournament.status === TournamentStatus.Pending}
-							<button class="join-tournament-btn" on:click|stopPropagation={enterTournament} disabled={isProcessing}>
-								{isProcessing ? 'ENTERING...' : 'ENTER TOURNAMENT'}
-							</button>
-						{/if}
-						{#if selectedTournamentId === tournament.id && hasJoined}
-							<div class="joined-badge">✓ JOINED</div>
-							{#if tournament.status === TournamentStatus.Active}
-								<button class="go-terminal-btn" on:click|stopPropagation={() => {
-									tradingModeStore.setTournamentMode(tournament.id);
-									goto('/');
-								}}>
-									→ GO TO TERMINAL
+						{#if selectedTournamentId === tournament.id && connectedWallet?.connected}
+							{@const userInLeaderboard = leaderboard.some(entry => entry.user === connectedWallet.publicKey?.toBase58())}
+							{@const userJoined = hasJoined || userInLeaderboard || participantData !== null}
+
+							{#if !userJoined && tournament.status === TournamentStatus.Pending}
+								<button class="join-tournament-btn" on:click|stopPropagation={enterTournament} disabled={isProcessing}>
+									{isProcessing ? 'ENTERING...' : 'ENTER TOURNAMENT'}
 								</button>
+							{/if}
+
+							{#if userJoined}
+								<div class="joined-badge">✓ JOINED</div>
+								{#if tournament.status === TournamentStatus.Active}
+									<button class="go-terminal-btn" on:click|stopPropagation={() => {
+										tradingModeStore.setTournamentMode(tournament.id);
+										goto('/');
+									}}>
+										→ GO TO TERMINAL
+									</button>
+								{/if}
 							{/if}
 						{/if}
 					</div>
@@ -446,7 +499,7 @@
 									<div class="stat-sublabel">P&L: {getTotalValue() > 10000 ? '+' : ''}${(getTotalValue() - 10000).toFixed(2)}</div>
 								</div>
 								<div class="stat-box">
-									<div class="stat-label">TRADES</div>
+									<div class="stat-label">POSITIONS</div>
 									<div class="stat-value large">{participantData.totalPositions}</div>
 								</div>
 							</div>
@@ -527,6 +580,45 @@
 				{/if}
 			</div>
 		</div>
+	</div>
+
+	<!-- Past Tournaments Section -->
+	<div class="past-tournaments-section">
+		<div class="section-header">
+			<div class="header-title">PAST TOURNAMENTS</div>
+		</div>
+		{#if pastTournaments.length > 0}
+			<div class="past-tournaments-grid">
+				{#each pastTournaments as tournament (tournament.id)}
+					<div class="past-tournament-card">
+						<div class="past-card-header">
+							<div class="tournament-id">#{tournament.id}</div>
+							<div class="tournament-status {getStatusClass(tournament.status)}">
+								{getStatusText(tournament.status)}
+							</div>
+						</div>
+						<div class="past-card-body">
+							<div class="past-stat">
+								<span class="stat-label">PRIZE POOL</span>
+								<span class="stat-value">{tournament.prizePool.toFixed(3)} SOL</span>
+							</div>
+							<div class="past-stat">
+								<span class="stat-label">PARTICIPANTS</span>
+								<span class="stat-value">{tournament.participantCount}</span>
+							</div>
+							<div class="past-stat">
+								<span class="stat-label">ENDED</span>
+								<span class="stat-value">{new Date(tournament.endTime).toLocaleDateString()}</span>
+							</div>
+						</div>
+					</div>
+				{/each}
+			</div>
+		{:else}
+			<div class="no-past-tournaments">
+				<p class="empty-hint">No completed tournaments yet</p>
+			</div>
+		{/if}
 	</div>
 
 	<!-- Prize Distribution Footer -->
@@ -1128,6 +1220,84 @@
 
 	.admin-btn:hover:not(:disabled) {
 		background: #444;
+	}
+
+	/* Past Tournaments Section */
+	.past-tournaments-section {
+		background: #000;
+		padding: 20px;
+		border-top: 1px solid #333;
+	}
+
+	.section-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 10px;
+	}
+
+	.section-header .header-title {
+		font-size: 14px;
+		font-weight: bold;
+		color: #ff9500;
+		letter-spacing: 2px;
+	}
+
+	.past-tournaments-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+		gap: 12px;
+		margin-top: 15px;
+	}
+
+	.past-tournament-card {
+		background: #0a0a0a;
+		border: 1px solid #333;
+		padding: 12px;
+		transition: all 0.2s;
+	}
+
+	.past-tournament-card:hover {
+		border-color: #666;
+		background: #111;
+	}
+
+	.past-card-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 10px;
+		padding-bottom: 8px;
+		border-bottom: 1px solid #222;
+	}
+
+	.past-card-body {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+
+	.past-stat {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		font-size: 10px;
+	}
+
+	.past-stat .stat-label {
+		color: #666;
+	}
+
+	.past-stat .stat-value {
+		color: #ff9500;
+		font-weight: bold;
+	}
+
+	.no-past-tournaments {
+		text-align: center;
+		padding: 40px 20px;
+		color: #666;
+		font-size: 11px;
 	}
 
 	.prize-footer {
