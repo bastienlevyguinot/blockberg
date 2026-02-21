@@ -1,12 +1,12 @@
 [toolchain]
-anchor_version = "0.30.1"
+anchor_version = "0.32.1"
 
 [features]
 resolution = true
 skip-lint = false
 
 [programs.devnet]
-paper_trading = "ENpbjfPxXx9fLhLDcqbLsHmo25LRU4fW9RXFfrqbKbmo"
+paper_trading = "GTyA9zS7YrRJ7LQCqeKAYZa4yL2CSCaH6SmEALEWAXAk"
 
 [programs."https://rpc.magicblock.app/devnet/"]
 close-position = "CXnKyp5DGMWRHsj9JsbECqBbDP1GeUF3c8AYSPZMmNb2"
