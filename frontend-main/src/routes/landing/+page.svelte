@@ -10,6 +10,8 @@
 	import WalletButton from '$lib/wallet/WalletButton.svelte';
 	import type { PageData } from './$types';
 	import { onMount } from 'svelte';
+	import { magicBlockClient, TournamentStatus, type Tournament } from '$lib/magicblock';
+	import { goto } from '$app/navigation';
 
 	// Get data from the load function
 	let { data }: { data: PageData } = $props();
@@ -30,6 +32,10 @@
 	let isLoadingComments = $state(false);
 	let isPostingComment = $state(false);
 
+	// Competitions state
+	let upcomingCompetitions = $state<Tournament[]>([]);
+	let isLoadingCompetitions = $state(true);
+
 	// Subscribe to wallet changes
 	walletStore.subscribe(wallet => {
 		if (wallet.connected && wallet.publicKey) {
@@ -42,6 +48,48 @@
 			likedPosts = new Set();
 		}
 	});
+
+	// Fetch upcoming competitions on mount
+	onMount(() => {
+		fetchCompetitions();
+	});
+
+	async function fetchCompetitions() {
+		try {
+			isLoadingCompetitions = true;
+			const allTournaments = await magicBlockClient.fetchTournaments();
+			// Filter for tournaments with at least 1 participant (not Settled)
+			upcomingCompetitions = allTournaments.filter(t => 
+				t.participantCount >= 1 && t.status !== TournamentStatus.Settled
+			).slice(0, 3); // Limit to 3 competitions
+		} catch (error) {
+			console.error('Failed to fetch competitions:', error);
+			upcomingCompetitions = [];
+		} finally {
+			isLoadingCompetitions = false;
+		}
+	}
+
+	function formatDate(date: Date): string {
+		return date.toLocaleDateString('en-US', { 
+			month: 'short', 
+			day: 'numeric', 
+			year: 'numeric',
+			hour: '2-digit',
+			minute: '2-digit'
+		});
+	}
+
+	function getCompetitionStatus(competition: Tournament): string {
+		if (competition.status === TournamentStatus.Pending) {
+			return 'Registration Open';
+		} else if (competition.status === TournamentStatus.Active) {
+			return 'Live Now';
+		} else if (competition.status === TournamentStatus.Ended) {
+			return 'Ended';
+		}
+		return 'Upcoming';
+	}
 
 	async function fetchUserLikes() {
 		if (!supabase || !userId) return;
@@ -275,7 +323,7 @@
 			<div class="nav-links">
 				<a href="/landing" class="nav-link active">Home</a>
 				<a href="#trading" class="nav-link">Trading</a>
-				<a href="/competition" class="nav-link">Competition</a>
+				<a href="#competitions" class="nav-link">Competition</a>
 				<a href="/" class="nav-link">Terminal</a>
 				<a href="/dashboard" class="nav-link">Dashboard</a>
 			</div>
@@ -473,6 +521,61 @@
 				</div>
 			</div>
 
+			<!-- Competitions Section -->
+			<div id="competitions" class="competitions-section">
+				<h3 class="section-subtitle competitions-title">Latest Upcoming Competitions</h3>
+				<p class="competitions-description">Join live competitions and compete with traders worldwide</p>
+				
+				{#if isLoadingCompetitions}
+					<div class="competitions-loading">
+						<p>Loading competitions...</p>
+					</div>
+				{:else if upcomingCompetitions.length === 0}
+					<div class="competitions-empty">
+						<p>No upcoming competitions at the moment. Check back soon!</p>
+						<a href="/competition" class="view-all-btn">View All Competitions</a>
+					</div>
+				{:else}
+					<div class="competitions-grid">
+						{#each upcomingCompetitions as competition}
+							<div class="competition-card">
+								<div class="competition-status {competition.status === TournamentStatus.Active ? 'live' : competition.status === TournamentStatus.Ended ? 'ended' : 'pending'}">
+									{getCompetitionStatus(competition)}
+								</div>
+								<h4 class="competition-title">Competition #{competition.id}</h4>
+								<div class="competition-details">
+									<div class="detail-item">
+										<span class="detail-label">Prize Pool</span>
+										<span class="detail-value">{competition.prizePool.toFixed(2)} SOL</span>
+									</div>
+									<div class="detail-item">
+										<span class="detail-label">Entry Fee</span>
+										<span class="detail-value">{competition.entryFee.toFixed(2)} SOL</span>
+									</div>
+									<div class="detail-item">
+										<span class="detail-label">Participants</span>
+										<span class="detail-value">{competition.participantCount}</span>
+									</div>
+									<div class="detail-item">
+										<span class="detail-label">Ends</span>
+										<span class="detail-value">{formatDate(competition.endTime)}</span>
+									</div>
+								</div>
+								<button 
+									class="join-competition-btn"
+									onclick={() => goto('/competition')}
+								>
+									{competition.status === TournamentStatus.Active ? 'Join Now' : 'View Details'}
+								</button>
+							</div>
+						{/each}
+					</div>
+					<div class="view-all-competitions">
+						<a href="/competition" class="view-all-btn">View All Competitions →</a>
+					</div>
+				{/if}
+			</div>
+
 			<!-- Features -->
 			<div class="features-section">
 				<h3 class="features-title">Platform Features</h3>
@@ -601,6 +704,11 @@
 		margin: 0;
 		padding: 0;
 		box-sizing: border-box;
+	}
+
+	html {
+		scroll-behavior: smooth;
+		scroll-padding-top: 80px; /* Account for fixed navbar */
 	}
 
 	.landing-container {
@@ -1085,6 +1193,174 @@
 		line-height: 1.6;
 	}
 
+	/* Competitions Section */
+	.competitions-section {
+		margin: 3rem 0;
+		padding: 2rem 0;
+		border-top: 1px solid #e0e0e0;
+		border-bottom: 1px solid #e0e0e0;
+	}
+
+	.competitions-title {
+		font-size: 2rem;
+		text-align: center;
+		margin-bottom: 0.5rem;
+		color: #000;
+	}
+
+	.competitions-description {
+		text-align: center;
+		color: #666;
+		margin-bottom: 2rem;
+		font-size: 1.1rem;
+	}
+
+	.competitions-loading,
+	.competitions-empty {
+		text-align: center;
+		padding: 2rem;
+		color: #666;
+	}
+
+	.competitions-empty p {
+		margin-bottom: 1rem;
+	}
+
+	.competitions-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+		gap: 2rem;
+		margin-bottom: 2rem;
+	}
+
+	.competition-card {
+		background: #fff;
+		border: 1px solid #e0e0e0;
+		border-radius: 12px;
+		padding: 1.5rem;
+		transition: all 0.3s ease;
+		position: relative;
+		overflow: hidden;
+	}
+
+	.competition-card:hover {
+		box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+		transform: translateY(-4px);
+		border-color: #ff9500;
+	}
+
+	.competition-status {
+		position: absolute;
+		top: 1rem;
+		right: 1rem;
+		padding: 0.4rem 0.8rem;
+		border-radius: 20px;
+		font-size: 0.875rem;
+		font-weight: 600;
+		text-transform: uppercase;
+	}
+
+	.competition-status.live {
+		background: #ff9500;
+		color: #fff;
+		animation: pulse 2s infinite;
+	}
+
+	.competition-status.pending {
+		background: #4CAF50;
+		color: #fff;
+	}
+
+	.competition-status.ended {
+		background: #9E9E9E;
+		color: #fff;
+	}
+
+	@keyframes pulse {
+		0%, 100% {
+			opacity: 1;
+		}
+		50% {
+			opacity: 0.7;
+		}
+	}
+
+	.competition-title {
+		font-size: 1.5rem;
+		font-weight: 700;
+		margin-bottom: 1.5rem;
+		color: #000;
+		padding-right: 6rem;
+	}
+
+	.competition-details {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 1rem;
+		margin-bottom: 1.5rem;
+	}
+
+	.detail-item {
+		display: flex;
+		flex-direction: column;
+		gap: 0.3rem;
+	}
+
+	.detail-label {
+		font-size: 0.875rem;
+		color: #666;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+	}
+
+	.detail-value {
+		font-size: 1.1rem;
+		font-weight: 600;
+		color: #000;
+	}
+
+	.join-competition-btn {
+		width: 100%;
+		padding: 0.875rem 1.5rem;
+		background: linear-gradient(135deg, #ff9500 0%, #ff7700 100%);
+		color: #fff;
+		border: none;
+		border-radius: 8px;
+		font-size: 1rem;
+		font-weight: 600;
+		cursor: pointer;
+		transition: all 0.3s ease;
+	}
+
+	.join-competition-btn:hover {
+		transform: translateY(-2px);
+		box-shadow: 0 4px 12px rgba(255, 149, 0, 0.4);
+	}
+
+	.view-all-competitions {
+		text-align: center;
+		margin-top: 2rem;
+	}
+
+	.view-all-btn {
+		display: inline-block;
+		padding: 0.875rem 2rem;
+		background: #fff;
+		color: #ff9500;
+		border: 2px solid #ff9500;
+		border-radius: 8px;
+		font-size: 1rem;
+		font-weight: 600;
+		text-decoration: none;
+		transition: all 0.3s ease;
+	}
+
+	.view-all-btn:hover {
+		background: #ff9500;
+		color: #fff;
+		transform: translateY(-2px);
+	}
+
 	/* Features Section */
 	.features-section {
 		margin-bottom: 4rem;
@@ -1261,6 +1537,19 @@
 		}
 
 		.trading-grid {
+			grid-template-columns: 1fr;
+		}
+
+		.competitions-grid {
+			grid-template-columns: 1fr;
+		}
+
+		.competition-title {
+			font-size: 1.3rem;
+			padding-right: 5rem;
+		}
+
+		.competition-details {
 			grid-template-columns: 1fr;
 		}
 	}
