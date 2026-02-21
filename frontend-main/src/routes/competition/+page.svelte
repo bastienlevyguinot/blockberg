@@ -223,7 +223,8 @@
 	<div class="command-bar">
 		<a href="/" class="logo">BLOCKBERG</a>
 		<div class="nav-links">
-			<a href="/" class="nav-link">TERMINAL</a>
+			<a href="/" class="nav-link">HOME</a>
+			<a href="/dashboard" class="nav-link">DASHBOARD</a>
 			<a href="/competition" class="nav-link active">COMPETITION</a>
 		</div>
 		<div class="status-bar">
