@@ -98,19 +98,21 @@
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		z-index: 1000;
+		z-index: 10000;
 		backdrop-filter: blur(4px);
+		padding: 20px;
 	}
 
 	.modal-content {
 		background: #1a1a1a;
 		border: 1px solid #333;
-		border-radius: 8px;
+		border-radius: 12px;
 		width: 90%;
-		max-width: 400px;
-		max-height: 80vh;
+		max-width: 420px;
+		max-height: 85vh;
 		overflow: hidden;
-		box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+		box-shadow: 0 8px 32px rgba(0, 0, 0, 0.7);
+		margin: auto;
 	}
 
 	.modal-header {

@@ -38,6 +38,24 @@ export interface TradePost {
   comments: number;
 }
 
+// Comment types
+export interface TradeCommentDB {
+  id: string;
+  trade_post_id: string;
+  author_pubkey: string;
+  author_username: string | null;
+  content: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TradeComment {
+  id: string;
+  author: string;
+  content: string;
+  createdAt: string;
+}
+
 // Map pair_index to trading pair symbols
 export const PAIR_SYMBOLS: Record<number, string> = {
   0: 'SOL/USDT',
@@ -76,5 +94,33 @@ export function convertTradePostFromDB(dbTrade: TradePostDB): TradePost {
     analysis: dbTrade.analysis || 'No analysis provided.',
     likes: dbTrade.likes_count,
     comments: dbTrade.comments_count
+  };
+}
+
+// Helper function to convert database comment to frontend format
+export function convertCommentFromDB(dbComment: TradeCommentDB): TradeComment {
+  const date = new Date(dbComment.created_at);
+  const formatDate = (date: Date): string => {
+    const month = date.toLocaleDateString('en-US', { month: 'short' });
+    const day = date.getDate();
+    const hours = date.getHours().toString().padStart(2, '0');
+    const minutes = date.getMinutes().toString().padStart(2, '0');
+    return `${month} ${day}, ${hours}:${minutes}`;
+  };
+  
+  // Format wallet address if no username
+  const formatWalletAddress = (address: string): string => {
+    if (!address || address.length < 8) return 'Anonymous';
+    return `${address.slice(0, 4)}...${address.slice(-4)}`;
+  };
+  
+  // Use username if available, otherwise format the wallet address
+  const authorName = dbComment.author_username || formatWalletAddress(dbComment.author_pubkey);
+  
+  return {
+    id: dbComment.id,
+    author: authorName,
+    content: dbComment.content,
+    createdAt: formatDate(date)
   };
 }
