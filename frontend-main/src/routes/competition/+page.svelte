@@ -1,24 +1,33 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { magicBlockClient } from '$lib/magicblock';
+	import { goto } from '$app/navigation';
+	import { magicBlockClient, TournamentStatus, type Tournament } from '$lib/magicblock';
 	import { walletStore } from '$lib/wallet/stores';
+	import { tradingModeStore } from '$lib/stores/tradingMode';
 	import WalletButton from '$lib/wallet/WalletButton.svelte';
 
-	let currentTime = new Date().toLocaleTimeString();
-	let competitionEndTime = new Date(Date.now() + 60 * 60 * 1000);
-	let timeRemaining = '01:00:00';
-
+	// Tournament state
+	let tournaments: Tournament[] = [];
+	let selectedTournament: Tournament | null = null;
+	let selectedTournamentId: number | null = null;
+	let participantData: any = null;
 	let leaderboard: any[] = [];
+	let hasJoined = false;
 
-	let recentActivity: any[] = [];
+	// Filter for active tournaments with participants
+	$: activeTournaments = tournaments.filter(t =>
+		t.status === TournamentStatus.Active && t.participantCount > 0
+	);
 
-	let competitionStats = {
-		totalVolume: 0,
-		totalTrades: 0,
-		avgTradeSize: 0,
-		topGainer: '+$0.00',
-		topLoser: '$0.00',
-		mostActive: '0 trades'
+	// Create tournament modal
+	let showCreateModal = false;
+	let createForm = {
+		tournamentId: Math.floor(Date.now() / 1000),
+		entryFee: 0.1,
+		durationMinutes: 60,
+		cooldownMinutes: 5,
+		durationUnit: 'minutes' as 'minutes' | 'days',
+		cooldownUnit: 'minutes' as 'minutes' | 'days'
 	};
 
 	let prices: Record<string, { price: number; change: number }> = {
@@ -31,9 +40,9 @@
 
 	let connectedWallet: any = null;
 	let walletAddress = '';
-	let isJoined = false;
-	let isJoining = false;
-	let competitionStatus = 'Loading...';
+	let isProcessing = false;
+	let statusMessage = '';
+	let currentTime = Date.now(); // For live countdown updates
 
 	// Subscribe to wallet changes
 	walletStore.subscribe(wallet => {
@@ -41,55 +50,183 @@
 		if (wallet.connected && wallet.publicKey) {
 			walletAddress = wallet.publicKey.toBase58();
 			magicBlockClient.setConnectedWallet(wallet.adapter);
-			checkCompetitionStatus();
+			refreshData();
 		} else {
 			walletAddress = '';
-			isJoined = false;
-			competitionStatus = 'Connect wallet to join competition';
+			hasJoined = false;
+			participantData = null;
 		}
 	});
 
-	async function checkCompetitionStatus() {
+	async function fetchTournaments() {
 		try {
-			const compData = await magicBlockClient.fetchCompetitionData();
-			if (compData) {
-				competitionEndTime = compData.endTime;
-				competitionStats.totalTrades = compData.totalParticipants;
-				competitionStatus = compData.isActive ? 'Ready to join competition' : 'Competition not active';
-			} else {
-				competitionStatus = 'Ready to join competition';
+			tournaments = await magicBlockClient.fetchTournaments();
+
+			// Auto-select first active or pending tournament
+			if (!selectedTournament && tournaments.length > 0) {
+				const activeTournament = tournaments.find(t =>
+					t.status === TournamentStatus.Active || t.status === TournamentStatus.Pending
+				);
+				if (activeTournament) {
+					await selectTournament(activeTournament.id);
+				} else {
+					await selectTournament(tournaments[0].id);
+				}
 			}
 		} catch (error) {
-			console.error('[COMPETITION] Failed to check status:', error);
-			competitionStatus = 'Status check failed';
+			console.error('Failed to fetch tournaments:', error);
 		}
 	}
 
-	async function joinCompetition() {
+	async function selectTournament(tournamentId: number) {
+		try {
+			selectedTournamentId = tournamentId;
+			selectedTournament = await magicBlockClient.fetchTournamentById(tournamentId);
+
+			if (connectedWallet?.connected) {
+				participantData = await magicBlockClient.fetchTournamentParticipant(tournamentId);
+				hasJoined = participantData !== null;
+			}
+
+			await fetchTournamentLeaderboard();
+		} catch (error) {
+			console.error('Failed to select tournament:', error);
+		}
+	}
+
+	async function fetchTournamentLeaderboard() {
+		if (!selectedTournamentId) return;
+
+		try {
+			const currentPrices: Record<string, number> = {};
+			for (const [symbol, priceData] of Object.entries(prices)) {
+				currentPrices[symbol] = priceData.price;
+			}
+
+			leaderboard = await magicBlockClient.fetchTournamentLeaderboard(selectedTournamentId, currentPrices);
+		} catch (error) {
+			console.error('Failed to fetch leaderboard:', error);
+		}
+	}
+
+	async function createTournament() {
 		if (!connectedWallet?.connected) {
 			alert('Please connect your wallet first');
 			return;
 		}
 
-		if (isJoining) return;
+		if (isProcessing) return;
 
 		try {
-			isJoining = true;
-			competitionStatus = 'Joining competition...';
-			
-			// Call the join-competition system through MagicBlock
-			const signature = await magicBlockClient.joinCompetition();
-			
-			isJoined = true;
-			competitionStatus = `Competition joined! ${signature.substring(0, 8)}...`;
-			
-			// Refresh leaderboard data
-			await fetchLeaderboard();
+			isProcessing = true;
+			statusMessage = 'Creating tournament...';
+
+			// Convert duration and cooldown to minutes based on selected unit
+			const durationInMinutes = createForm.durationUnit === 'days'
+				? createForm.durationMinutes * 1440
+				: createForm.durationMinutes;
+			const cooldownInMinutes = createForm.cooldownUnit === 'days'
+				? createForm.cooldownMinutes * 1440
+				: createForm.cooldownMinutes;
+
+			const signature = await magicBlockClient.createTournament(
+				createForm.tournamentId,
+				createForm.entryFee,
+				durationInMinutes,
+				cooldownInMinutes
+			);
+
+			console.log('[CREATE] Tournament created, signature:', signature);
+			statusMessage = `Tournament created! Refreshing...`;
+
+			const createdTournamentId = createForm.tournamentId;
+			showCreateModal = false;
+
+			// Wait a bit for RPC to index the new account
+			await new Promise(resolve => setTimeout(resolve, 2000));
+
+			// Verify tournament was created
+			const verifyTournament = await magicBlockClient.fetchTournamentById(createdTournamentId);
+			console.log('[CREATE] Verification - tournament exists:', verifyTournament);
+
+			// Reset form
+			createForm.tournamentId = Math.floor(Date.now() / 1000);
+
+			// Fetch all tournaments
+			await fetchTournaments();
+
+			if (verifyTournament) {
+				// Auto-select the newly created tournament
+				await selectTournament(createdTournamentId);
+			}
+
+			statusMessage = `Tournament #${createdTournamentId} created! ${signature.substring(0, 8)}...`;
 		} catch (error: any) {
-			console.error('[COMPETITION] Failed to join:', error);
-			competitionStatus = `Join failed: ${error.message}`;
+			console.error('Failed to create tournament:', error);
+			statusMessage = `Create failed: ${error.message}`;
 		} finally {
-			isJoining = false;
+			isProcessing = false;
+			setTimeout(() => statusMessage = '', 5000);
+		}
+	}
+
+	async function enterTournament() {
+		if (!connectedWallet?.connected || !selectedTournamentId) {
+			alert('Please connect your wallet first');
+			return;
+		}
+
+		if (isProcessing) return;
+
+		try {
+			isProcessing = true;
+			statusMessage = 'Entering tournament...';
+
+			const signature = await magicBlockClient.enterTournament(selectedTournamentId);
+
+			statusMessage = `Entered tournament! ${signature.substring(0, 8)}...`;
+			hasJoined = true;
+
+			await refreshData();
+		} catch (error: any) {
+			console.error('Failed to enter tournament:', error);
+			statusMessage = `Entry failed: ${error.message}`;
+		} finally {
+			isProcessing = false;
+			setTimeout(() => statusMessage = '', 5000);
+		}
+	}
+
+	async function startTournament() {
+		if (!connectedWallet?.connected || !selectedTournamentId) {
+			alert('Please connect your wallet first');
+			return;
+		}
+
+		if (isProcessing) return;
+
+		try {
+			isProcessing = true;
+			statusMessage = 'Starting tournament...';
+
+			const signature = await magicBlockClient.startTournament(selectedTournamentId);
+
+			statusMessage = `Tournament started! ${signature.substring(0, 8)}...`;
+
+			await refreshData();
+		} catch (error: any) {
+			console.error('Failed to start tournament:', error);
+			statusMessage = `Start failed: ${error.message}`;
+		} finally {
+			isProcessing = false;
+			setTimeout(() => statusMessage = '', 5000);
+		}
+	}
+
+	async function refreshData() {
+		await fetchTournaments();
+		if (selectedTournamentId) {
+			await selectTournament(selectedTournamentId);
 		}
 	}
 
@@ -113,108 +250,81 @@
 				}
 			}
 		} catch (error) {
-			console.error('[COMPETITION] Failed to fetch prices:', error);
+			console.error('Failed to fetch prices:', error);
 		}
 	}
 
-	async function fetchLeaderboard() {
-		try {
-			const currentPrices: Record<string, number> = {};
-			for (const [symbol, priceData] of Object.entries(prices)) {
-				currentPrices[symbol] = priceData.price;
-			}
-
-			const data = await magicBlockClient.fetchLeaderboard(currentPrices);
-			leaderboard = data;
-
-			if (data.length > 0) {
-				competitionStats.topGainer = `+$${Math.max(...data.map(p => p.pnl)).toFixed(2)}`;
-				competitionStats.mostActive = `${Math.max(...data.map(p => p.trades))} trades`;
-			}
-		} catch (error) {
-			console.error('[COMPETITION] Failed to fetch leaderboard:', error);
+	function getStatusText(status: TournamentStatus): string {
+		switch (status) {
+			case TournamentStatus.Pending: return 'REGISTRATION';
+			case TournamentStatus.Active: return 'LIVE';
+			case TournamentStatus.Ended: return 'ENDED';
+			case TournamentStatus.Settled: return 'SETTLED';
+			default: return 'UNKNOWN';
 		}
 	}
 
-	async function fetchRecentActivity() {
-		try {
-			const allPositions = await magicBlockClient.fetchPositions();
-			recentActivity = allPositions
-				.sort((a, b) => b.openedAt.getTime() - a.openedAt.getTime())
-				.slice(0, 10)
-				.map(p => ({
-					trader: p.pubkey?.substring(0, 8) || 'Unknown',
-					action: `${p.direction} ${p.pairSymbol}`,
-					size: `$${(p.amountTokenOut * p.entryPrice).toFixed(2)}`,
-					price: `$${p.entryPrice.toFixed(2)}`,
-					time: p.openedAt.toLocaleTimeString()
-				}));
-		} catch (error) {
-			console.error('[COMPETITION] Failed to fetch activity:', error);
+	function getStatusClass(status: TournamentStatus): string {
+		switch (status) {
+			case TournamentStatus.Pending: return 'status-pending';
+			case TournamentStatus.Active: return 'status-active';
+			case TournamentStatus.Ended: return 'status-ended';
+			case TournamentStatus.Settled: return 'status-settled';
+			default: return '';
 		}
 	}
 
-	function updateTime() {
-		currentTime = new Date().toLocaleTimeString();
-		const now = Date.now();
-		const diff = competitionEndTime.getTime() - now;
-		if (diff > 0) {
-			const hours = Math.floor(diff / 3600000);
-			const minutes = Math.floor((diff % 3600000) / 60000);
-			const seconds = Math.floor((diff % 60000) / 1000);
-			timeRemaining = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-		} else {
-			timeRemaining = 'ENDED';
-		}
+	function getTimeRemaining(tournament: Tournament): string {
+		const targetTime = tournament.status === TournamentStatus.Pending
+			? tournament.cooldownEnd.getTime()
+			: tournament.endTime.getTime();
+
+		const diff = targetTime - currentTime;
+		if (diff <= 0) return '00:00:00';
+
+		const hours = Math.floor(diff / 3600000);
+		const minutes = Math.floor((diff % 3600000) / 60000);
+		const seconds = Math.floor((diff % 60000) / 1000);
+		return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
 	}
 
+	function getTotalValue(): number {
+		if (!participantData) return 0;
+		return participantData.usdtBalance +
+			participantData.solBalance * prices.SOL.price +
+			participantData.btcBalance * prices.BTC.price +
+			participantData.ethBalance * prices.ETH.price +
+			participantData.avaxBalance * prices.AVAX.price +
+			participantData.linkBalance * prices.LINK.price;
+	}
 
-	onMount(async () => {
+	onMount(() => {
 		console.log('[COMPETITION] Initializing competition page...');
 
-		try {
-			await magicBlockClient.initializeSessionWallet();
-		} catch (error) {
-			console.error('[COMPETITION] Failed to initialize MagicBlock:', error);
-		}
-
-		try {
-			const compData = await magicBlockClient.fetchCompetitionData();
-			if (compData) {
-				competitionEndTime = compData.endTime;
-				console.log('[COMPETITION] Competition data:', {
-					startTime: compData.startTime,
-					endTime: compData.endTime,
-					name: compData.name,
-					participants: compData.totalParticipants
-				});
-			} else {
-				console.log('[COMPETITION] No competition data found, using default 60min timer');
-			}
-		} catch (error) {
-			console.error('[COMPETITION] Failed to fetch competition data:', error);
-		}
-
-		updateTime();
-		const timeInterval = setInterval(updateTime, 1000);
-
-		await fetchPrices();
-		await fetchLeaderboard();
-		await fetchRecentActivity();
+		// Initial fetch
+		fetchPrices();
+		fetchTournaments();
 
 		const priceInterval = setInterval(async () => {
 			await fetchPrices();
-		}, 2000);
+			if (selectedTournamentId) {
+				await fetchTournamentLeaderboard();
+			}
+		}, 5000);
 
 		const dataInterval = setInterval(async () => {
-			await fetchLeaderboard();
-			await fetchRecentActivity();
-		}, 60000);
+			await refreshData();
+		}, 30000);
+
+		// Update countdown every second
+		const countdownInterval = setInterval(() => {
+			currentTime = Date.now();
+		}, 1000);
 
 		return () => {
-			clearInterval(timeInterval);
 			clearInterval(priceInterval);
 			clearInterval(dataInterval);
+			clearInterval(countdownInterval);
 		};
 	});
 </script>
@@ -223,22 +333,23 @@
 	<div class="command-bar">
 		<a href="/" class="logo">BLOCKBERG</a>
 		<div class="nav-links">
-			<a href="/" class="nav-link">HOME</a>
-			<a href="/dashboard" class="nav-link">DASHBOARD</a>
-			<a href="/competition" class="nav-link active">COMPETITION</a>
+			<a href="/" class="nav-link">TERMINAL</a>
+			<a href="/competition" class="nav-link active">TOURNAMENTS</a>
 		</div>
 		<div class="status-bar">
-			<span class="status-item">COMP #42</span>
-			<span class="status-item">TIME: {timeRemaining}</span>
-			<span class="status-item">VOL: ${(competitionStats.totalVolume / 1000).toFixed(0)}K</span>
-			<span class="status-item">TRADES: {competitionStats.totalTrades}</span>
-			{#if connectedWallet?.connected}
-				<span class="status-item">
-					{walletAddress.substring(0, 4)}...{walletAddress.substring(walletAddress.length - 4)}
+			{#if selectedTournament}
+				<span class="status-item">#{selectedTournament.id}</span>
+				<span class="status-item {getStatusClass(selectedTournament.status)}">
+					{getStatusText(selectedTournament.status)}
 				</span>
-				<span class="status-item {isJoined ? 'joined' : 'not-joined'}">
-					{competitionStatus}
-				</span>
+				<span class="status-item">TIME: {getTimeRemaining(selectedTournament)}</span>
+				<span class="status-item">POOL: {selectedTournament.prizePool.toFixed(2)} SOL</span>
+				<span class="status-item">PLAYERS: {selectedTournament.participantCount}</span>
+			{:else}
+				<span class="status-item">NO TOURNAMENT SELECTED</span>
+			{/if}
+			{#if statusMessage}
+				<span class="status-item status-message">{statusMessage}</span>
 			{/if}
 		</div>
 		<div class="wallet-section">
@@ -246,129 +357,260 @@
 		</div>
 	</div>
 
-	<div class="main-grid">
-		<div class="ticker-panel">
-			<div class="panel-header">COMPETITION STATS • LIVE</div>
-			<div class="ticker-stats">
-				<div class="ticker-item">
-					<span class="ticker-label">ENTRY</span>
-					<span class="ticker-value">0.1 SOL</span>
-				</div>
-				<div class="ticker-item">
-					<span class="ticker-label">PRIZE</span>
-					<span class="ticker-value green">15.5 SOL</span>
-				</div>
-				<div class="ticker-item">
-					<span class="ticker-label">BALANCE</span>
-					<span class="ticker-value">$10,000</span>
-				</div>
-				<div class="ticker-item">
-					<span class="ticker-label">DURATION</span>
-					<span class="ticker-value">60 MIN</span>
-				</div>
-				<div class="ticker-item">
-					<span class="ticker-label">PLAYERS</span>
-					<span class="ticker-value">127</span>
-				</div>
-				<div class="ticker-item">
-					<span class="ticker-label">TOP</span>
-					<span class="ticker-value green">{competitionStats.topGainer}</span>
-				</div>
-			</div>
+	<div class="main-content">
+		<!-- Header with Create Button -->
+		<div class="content-header">
+			<div class="header-title">AVAILABLE TOURNAMENTS</div>
+			{#if connectedWallet?.connected}
+				<button class="create-tournament-btn" on:click={() => showCreateModal = true}>
+					+ CREATE TOURNAMENT
+				</button>
+			{/if}
 		</div>
 
-		<div class="leaderboard-panel">
-			<div class="panel-header">LIVE LEADERBOARD • TOP 10</div>
-			<div class="data-table">
-				<div class="table-row header">
-					<div class="col-rank">RNK</div>
-					<div class="col-player">PLAYER</div>
-					<div class="col-pnl">P&L</div>
-					<div class="col-balance">BALANCE</div>
-					<div class="col-trades">TRD</div>
-					<div class="col-volume">VOLUME</div>
-					<div class="col-last">LAST TRADE</div>
-				</div>
-				{#each leaderboard as entry}
-					<div class="table-row" class:flash={entry.rank === 1}>
-						<div class="col-rank rank-{entry.rank}">{entry.rank}</div>
-						<div class="col-player">{entry.player}</div>
-						<div class="col-pnl" class:green={entry.pnl > 0} class:red={entry.pnl < 0}>
-							{entry.pnl > 0 ? '+' : ''}{entry.pnl.toFixed(2)}
+		<!-- Main Grid Layout -->
+		<div class="tournament-grid">
+			<!-- Tournament Cards -->
+			<div class="tournaments-section">
+				{#each activeTournaments as tournament}
+					<div
+						class="tournament-card"
+						class:selected={selectedTournamentId === tournament.id}
+						on:click={() => selectTournament(tournament.id)}
+					>
+						<div class="card-header">
+							<div class="tournament-id">TOURNAMENT #{tournament.id}</div>
+							<div class="tournament-status {getStatusClass(tournament.status)}">
+								{getStatusText(tournament.status)}
+							</div>
 						</div>
-						<div class="col-balance">${entry.balance.toLocaleString()}</div>
-						<div class="col-trades">{entry.trades}</div>
-						<div class="col-volume">${(entry.volume / 1000).toFixed(0)}K</div>
-						<div class="col-last">{entry.lastTrade}</div>
+						<div class="card-body">
+							<div class="card-stat">
+								<span class="stat-label">ENTRY FEE</span>
+								<span class="stat-value">{tournament.entryFee} SOL</span>
+							</div>
+							<div class="card-stat">
+								<span class="stat-label">PRIZE POOL</span>
+								<span class="stat-value green">{tournament.prizePool.toFixed(3)} SOL</span>
+							</div>
+							<div class="card-stat">
+								<span class="stat-label">PARTICIPANTS</span>
+								<span class="stat-value">{tournament.participantCount}</span>
+							</div>
+							<div class="card-stat">
+								<span class="stat-label">{tournament.status === TournamentStatus.Pending ? 'STARTS IN' : 'ENDS IN'}</span>
+								<span class="stat-value orange">{getTimeRemaining(tournament)}</span>
+							</div>
+						</div>
+						{#if selectedTournamentId === tournament.id && connectedWallet?.connected && !hasJoined && tournament.status === TournamentStatus.Pending}
+							<button class="join-tournament-btn" on:click|stopPropagation={enterTournament} disabled={isProcessing}>
+								{isProcessing ? 'ENTERING...' : 'ENTER TOURNAMENT'}
+							</button>
+						{/if}
+						{#if selectedTournamentId === tournament.id && hasJoined}
+							<div class="joined-badge">✓ JOINED</div>
+							{#if tournament.status === TournamentStatus.Active}
+								<button class="go-terminal-btn" on:click|stopPropagation={() => {
+									tradingModeStore.setTournamentMode(tournament.id);
+									goto('/');
+								}}>
+									→ GO TO TERMINAL
+								</button>
+							{/if}
+						{/if}
 					</div>
-				{/each}
-			</div>
-		</div>
-
-		<div class="activity-panel">
-			<div class="panel-header">TRADE ACTIVITY • LIVE FEED</div>
-			<div class="activity-feed">
-				{#each recentActivity as activity}
-					<div class="activity-row" class:entry={activity.type === 'ENTRY'} class:exit={activity.type === 'EXIT'}>
-						<span class="activity-time">{activity.time}</span>
-						<span class="activity-player">{activity.player}</span>
-						<span class="activity-action {activity.action.toLowerCase()}">{activity.action}</span>
-						<span class="activity-direction {activity.direction.toLowerCase()}">{activity.direction}</span>
-						<span class="activity-symbol">{activity.symbol}</span>
-						<span class="activity-price">@{activity.price.toFixed(2)}</span>
-						<span class="activity-size">{activity.size}</span>
-						{#if activity.pnl !== undefined}
-							<span class="activity-pnl" class:green={activity.pnl > 0} class:red={activity.pnl < 0}>
-								{activity.pnl > 0 ? '+' : ''}{activity.pnl}
-							</span>
+				{:else}
+					<div class="no-tournaments">
+						<div class="empty-icon">◇</div>
+						<p class="empty-title">NO TOURNAMENTS AVAILABLE</p>
+						{#if connectedWallet?.connected}
+							<p class="empty-hint">Create your first tournament to get started</p>
+						{:else}
+							<p class="empty-hint">Connect wallet to create a tournament</p>
 						{/if}
 					</div>
 				{/each}
 			</div>
-		</div>
 
-		<div class="join-panel">
-			<div class="nft-info">
-				<div class="nft-header">
-					NFT TROPHY REWARDS
-					{#if connectedWallet?.connected && !isJoined}
-						<button 
-							class="join-button" 
-							disabled={isJoining}
-							on:click={joinCompetition}
-						>
-							{isJoining ? 'JOINING...' : 'JOIN COMPETITION'}
-						</button>
-					{:else if !connectedWallet?.connected}
-						<span class="join-hint">Connect wallet to join competition</span>
-					{:else if isJoined}
-						<span class="joined-indicator">✓ JOINED</span>
+			<!-- Stats and Leaderboard -->
+			<div class="info-section">
+				{#if selectedTournament}
+					<!-- Your Stats -->
+					{#if hasJoined && participantData}
+						<div class="stats-panel">
+							<div class="panel-header">YOUR PORTFOLIO</div>
+							<div class="stats-grid">
+								<div class="stat-box">
+									<div class="stat-label">TOTAL VALUE</div>
+									<div class="stat-value large green">${getTotalValue().toLocaleString(undefined, {maximumFractionDigits: 2})}</div>
+									<div class="stat-sublabel">P&L: {getTotalValue() > 10000 ? '+' : ''}${(getTotalValue() - 10000).toFixed(2)}</div>
+								</div>
+								<div class="stat-box">
+									<div class="stat-label">TRADES</div>
+									<div class="stat-value large">{participantData.totalPositions}</div>
+								</div>
+							</div>
+							<div class="balances-grid">
+								<div class="balance-item">
+									<span>USDT</span>
+									<span class="balance-value">${participantData.usdtBalance.toLocaleString()}</span>
+								</div>
+								<div class="balance-item">
+									<span>SOL</span>
+									<span class="balance-value">{participantData.solBalance.toFixed(4)}</span>
+								</div>
+								<div class="balance-item">
+									<span>BTC</span>
+									<span class="balance-value">{participantData.btcBalance.toFixed(6)}</span>
+								</div>
+								<div class="balance-item">
+									<span>ETH</span>
+									<span class="balance-value">{participantData.ethBalance.toFixed(4)}</span>
+								</div>
+								<div class="balance-item">
+									<span>AVAX</span>
+									<span class="balance-value">{participantData.avaxBalance.toFixed(2)}</span>
+								</div>
+								<div class="balance-item">
+									<span>LINK</span>
+									<span class="balance-value">{participantData.linkBalance.toFixed(2)}</span>
+								</div>
+							</div>
+							<button class="trade-link" on:click={() => {
+								if (selectedTournamentId) {
+									tradingModeStore.setTournamentMode(selectedTournamentId);
+									goto('/');
+								}
+							}}>→ GO TO TERMINAL TO TRADE</button>
+						</div>
 					{/if}
-				</div>
-				<div class="nft-tiers">
-					<div class="nft-tier">
-						<div class="tier-rank gold">1ST PLACE</div>
-						<div class="tier-prize">GOLD TROPHY NFT + 50% PRIZE POOL</div>
-						<div class="tier-details">Legendary • Animated • Transferable • On-Chain Verified</div>
+
+					<!-- Leaderboard -->
+					<div class="leaderboard-panel">
+						<div class="panel-header">LIVE LEADERBOARD • TOP 10</div>
+						<div class="leaderboard-table">
+							<div class="table-header">
+								<div class="col-rank">RNK</div>
+								<div class="col-player">PLAYER</div>
+								<div class="col-pnl">P&L</div>
+								<div class="col-balance">BALANCE</div>
+								<div class="col-trades">TRADES</div>
+							</div>
+							{#each leaderboard.slice(0, 10) as entry}
+								<div class="table-row" class:highlight={entry.rank <= 3}>
+									<div class="col-rank rank-{entry.rank}">{entry.rank}</div>
+									<div class="col-player">{entry.address}</div>
+									<div class="col-pnl" class:green={entry.pnl > 0} class:red={entry.pnl < 0}>
+										{entry.pnl > 0 ? '+' : ''}${entry.pnl.toFixed(2)}
+									</div>
+									<div class="col-balance">${entry.balance.toLocaleString()}</div>
+									<div class="col-trades">{entry.trades}</div>
+								</div>
+							{:else}
+								<div class="no-data">No participants yet</div>
+							{/each}
+						</div>
 					</div>
-					<div class="nft-tier">
-						<div class="tier-rank silver">2ND PLACE</div>
-						<div class="tier-prize">SILVER TROPHY NFT + 30% PRIZE POOL</div>
-						<div class="tier-details">Epic • Animated • Transferable • On-Chain Verified</div>
+
+					<!-- Admin Actions -->
+					{#if selectedTournament.status === TournamentStatus.Pending && connectedWallet?.connected}
+						<button class="admin-btn" on:click={startTournament} disabled={isProcessing}>
+							START TOURNAMENT (Admin)
+						</button>
+					{/if}
+				{:else}
+					<div class="no-selection">
+						<div class="empty-icon">→</div>
+						<p class="empty-title">SELECT A TOURNAMENT</p>
+						<p class="empty-hint">Click on a tournament card to view details and leaderboard</p>
 					</div>
-					<div class="nft-tier">
-						<div class="tier-rank bronze">3RD PLACE</div>
-						<div class="tier-prize">BRONZE TROPHY NFT + 20% PRIZE POOL</div>
-						<div class="tier-details">Rare • Animated • Transferable • On-Chain Verified</div>
-					</div>
-				</div>
-				<div class="nft-footer">
-					All NFT trophies are minted on-chain and stored permanently in your wallet. Each trophy includes competition stats, timestamp, and leaderboard placement verification.
-				</div>
+				{/if}
 			</div>
 		</div>
 	</div>
+
+	<!-- Prize Distribution Footer -->
+	<div class="prize-footer">
+		<div class="prize-header">PRIZE DISTRIBUTION</div>
+		<div class="prize-grid">
+			<div class="prize-box gold">
+				<div class="prize-rank">1ST</div>
+				<div class="prize-percent">50%</div>
+				<div class="prize-amount">{selectedTournament ? `${(selectedTournament.prizePool * 0.5).toFixed(3)} SOL` : '—'}</div>
+			</div>
+			<div class="prize-box silver">
+				<div class="prize-rank">2ND</div>
+				<div class="prize-percent">30%</div>
+				<div class="prize-amount">{selectedTournament ? `${(selectedTournament.prizePool * 0.3).toFixed(3)} SOL` : '—'}</div>
+			</div>
+			<div class="prize-box bronze">
+				<div class="prize-rank">3RD</div>
+				<div class="prize-percent">15%</div>
+				<div class="prize-amount">{selectedTournament ? `${(selectedTournament.prizePool * 0.15).toFixed(3)} SOL` : '—'}</div>
+			</div>
+			<div class="prize-box treasury">
+				<div class="prize-rank">TREASURY</div>
+				<div class="prize-percent">5%</div>
+				<div class="prize-amount">{selectedTournament ? `${(selectedTournament.prizePool * 0.05).toFixed(3)} SOL` : '—'}</div>
+			</div>
+		</div>
+		<div class="prize-info">
+			All participants start with $10,000 USDT • Trade SOL, BTC, ETH, AVAX, LINK • Top 3 win prizes
+		</div>
+	</div>
 </div>
+
+<!-- Create Tournament Modal -->
+{#if showCreateModal}
+	<div class="modal-overlay" on:click={() => showCreateModal = false}>
+		<div class="modal-content" on:click|stopPropagation>
+			<div class="modal-header">
+				<h2>CREATE TOURNAMENT</h2>
+				<button class="modal-close" on:click={() => showCreateModal = false}>×</button>
+			</div>
+			<div class="modal-body">
+				<div class="form-group">
+					<label>TOURNAMENT ID</label>
+					<input type="number" bind:value={createForm.tournamentId} />
+					<span class="form-hint">Unique identifier for this tournament</span>
+				</div>
+				<div class="form-group">
+					<label>ENTRY FEE (SOL)</label>
+					<input type="number" step="0.01" bind:value={createForm.entryFee} />
+					<span class="form-hint">Minimum: 0.01 SOL</span>
+				</div>
+				<div class="form-group">
+					<label>DURATION</label>
+					<div class="input-group">
+						<input type="number" bind:value={createForm.durationMinutes} />
+						<select bind:value={createForm.durationUnit}>
+							<option value="minutes">Minutes</option>
+							<option value="days">Days</option>
+						</select>
+					</div>
+					<span class="form-hint">How long the tournament lasts (min: 5 min)</span>
+				</div>
+				<div class="form-group">
+					<label>REGISTRATION PERIOD</label>
+					<div class="input-group">
+						<input type="number" bind:value={createForm.cooldownMinutes} />
+						<select bind:value={createForm.cooldownUnit}>
+							<option value="minutes">Minutes</option>
+							<option value="days">Days</option>
+						</select>
+					</div>
+					<span class="form-hint">Time before tournament starts (min: 1 min)</span>
+				</div>
+			</div>
+			<div class="modal-footer">
+				<button class="modal-cancel" on:click={() => showCreateModal = false}>CANCEL</button>
+				<button class="modal-submit" on:click={createTournament} disabled={isProcessing}>
+					{isProcessing ? 'CREATING...' : 'CREATE TOURNAMENT'}
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
 
 <style>
 	.bloomberg {
@@ -376,6 +618,8 @@
 		background: #000;
 		color: #fff;
 		font-family: 'Courier New', monospace;
+		display: flex;
+		flex-direction: column;
 	}
 
 	.command-bar {
@@ -421,9 +665,10 @@
 
 	.status-bar {
 		display: flex;
-		gap: 20px;
+		gap: 12px;
 		margin-left: auto;
-		font-size: 12px;
+		font-size: 11px;
+		flex-wrap: wrap;
 	}
 
 	.status-item {
@@ -431,292 +676,48 @@
 		padding: 3px 8px;
 		background: #000;
 		border: 1px solid #333;
+		white-space: nowrap;
 	}
 
-	.main-grid {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		grid-template-rows: auto 1fr auto;
-		gap: 1px;
-		background: #333;
-		height: calc(100vh - 40px);
-	}
+	.status-pending { background: #ff9500; color: #000; }
+	.status-active { background: #00ff00; color: #000; }
+	.status-ended { background: #ff0000; color: #fff; }
+	.status-settled { background: #666; color: #fff; }
 
-	.ticker-panel {
-		grid-column: 1 / -1;
-		background: #000;
-		border-bottom: 1px solid #333;
-	}
-
-	.panel-header {
-		background: #1a1a1a;
-		padding: 6px 12px;
-		border-bottom: 1px solid #ff9500;
-		font-size: 11px;
-		font-weight: bold;
-		letter-spacing: 1px;
-		color: #ff9500;
-	}
-
-	.ticker-stats {
-		display: flex;
-		gap: 1px;
-		background: #111;
-	}
-
-	.ticker-item {
-		flex: 1;
-		padding: 12px;
-		background: #000;
-		display: flex;
-		flex-direction: column;
-		gap: 6px;
-	}
-
-	.ticker-label {
-		font-size: 10px;
-		color: #666;
-	}
-
-	.ticker-value {
-		font-size: 16px;
-		color: #fff;
-	}
-
-	.ticker-value.green {
-		color: #00ff00;
-	}
-
-	.leaderboard-panel {
-		background: #000;
-		overflow-y: auto;
-	}
-
-	.data-table {
-		font-size: 11px;
-	}
-
-	.table-row {
-		display: grid;
-		grid-template-columns: 40px 120px 100px 120px 50px 80px 1fr;
-		gap: 8px;
-		padding: 8px 12px;
-		border-bottom: 1px solid #111;
-	}
-
-	.table-row.header {
-		background: #1a1a1a;
-		color: #666;
-		font-weight: bold;
-		position: sticky;
-		top: 0;
-		z-index: 10;
-		border-bottom: 1px solid #ff9500;
-	}
-
-	.table-row:not(.header):hover {
-		background: #0a0a0a;
-	}
-
-	.table-row.flash {
-		animation: pulse 2s infinite;
-	}
-
-	@keyframes pulse {
-		0%, 100% { background: #000; }
-		50% { background: #1a1a00; }
-	}
-
-	.col-rank {
-		color: #ff9500;
-		font-weight: bold;
-	}
-
-	.col-rank.rank-1 { color: #ffaa00; }
-	.col-rank.rank-2 { color: #aaaaaa; }
-	.col-rank.rank-3 { color: #cd7f32; }
-
-	.col-player {
-		color: #00ccff;
-	}
-
-	.green {
-		color: #00ff00;
-	}
-
-	.red {
-		color: #ff0000;
-	}
-
-	.activity-panel {
-		background: #000;
-		overflow-y: auto;
-	}
-
-	.activity-feed {
-		font-size: 10px;
-	}
-
-	.activity-row {
-		display: grid;
-		grid-template-columns: 80px 120px 80px 60px 60px 90px 60px 80px;
-		gap: 8px;
-		padding: 6px 12px;
-		border-bottom: 1px solid #0a0a0a;
-		transition: background 0.3s;
-	}
-
-	.activity-row:nth-child(1) {
-		background: #0a0a00;
-	}
-
-	.activity-row:hover {
-		background: #1a1a1a;
-	}
-
-	.activity-time {
-		color: #666;
-	}
-
-	.activity-player {
-		color: #00ccff;
-	}
-
-	.activity-action.opened {
-		color: #00ff00;
-	}
-
-	.activity-action.closed {
-		color: #ff9500;
-	}
-
-	.activity-direction.long {
-		color: #00ff00;
-	}
-
-	.activity-direction.short {
-		color: #ff0000;
-	}
-
-	.activity-symbol {
-		color: #fff;
-		font-weight: bold;
-	}
-
-	.activity-price {
+	.status-message {
+		background: #1a1a00;
 		color: #ffaa00;
 	}
 
-	.activity-size {
-		color: #999;
+	.wallet-section {
+		display: flex;
+		align-items: center;
 	}
 
-	.activity-pnl {
-		font-weight: bold;
-	}
-
-	.join-panel {
-		grid-column: 1 / -1;
-		background: #000;
-		padding: 15px;
-		border-top: 2px solid #ff9500;
-	}
-
-	.nft-info {
-		background: #0a0a0a;
-		border: 1px solid #333;
-		padding: 15px;
-	}
-
-	.nft-header {
-		color: #ff9500;
-		font-size: 13px;
-		margin-bottom: 12px;
-		letter-spacing: 1px;
-		border-bottom: 1px solid #333;
-		padding-bottom: 8px;
-	}
-
-	.nft-tiers {
-		display: grid;
-		grid-template-columns: repeat(3, 1fr);
-		gap: 12px;
-		margin-bottom: 12px;
-	}
-
-	.nft-tier {
-		background: #000;
-		border: 1px solid #222;
-		padding: 10px;
+	.main-content {
+		flex: 1;
 		display: flex;
 		flex-direction: column;
-		gap: 6px;
+		overflow: hidden;
 	}
 
-	.tier-rank {
-		font-size: 11px;
-		padding: 4px 6px;
-		text-align: center;
-	}
-
-	.tier-rank.gold {
-		background: linear-gradient(180deg, #ffaa00 0%, #ff8800 100%);
-		color: #000;
-	}
-
-	.tier-rank.silver {
-		background: linear-gradient(180deg, #cccccc 0%, #888888 100%);
-		color: #000;
-	}
-
-	.tier-rank.bronze {
-		background: linear-gradient(180deg, #cd7f32 0%, #8b5a2b 100%);
-		color: #000;
-	}
-
-	.tier-prize {
-		font-size: 10px;
-		color: #fff;
-	}
-
-	.tier-details {
-		font-size: 8px;
-		color: #666;
-		line-height: 1.4;
-	}
-
-	.nft-footer {
-		font-size: 9px;
-		color: #999;
-		line-height: 1.5;
-		padding-top: 10px;
-		border-top: 1px solid #222;
-	}
-
-	.wallet-section {
-		margin-left: auto;
+	.content-header {
+		background: #1a1a1a;
+		padding: 12px 20px;
+		border-bottom: 2px solid #ff9500;
 		display: flex;
-		align-items: center;
-	}
-
-	.status-item.joined {
-		background: #00ff00;
-		color: #000;
-	}
-
-	.status-item.not-joined {
-		background: #ff9500;
-		color: #000;
-	}
-
-	.nft-header {
-		display: flex;
-		align-items: center;
 		justify-content: space-between;
-		gap: 15px;
+		align-items: center;
 	}
 
-	.join-button {
+	.header-title {
+		font-size: 14px;
+		font-weight: bold;
+		color: #ff9500;
+		letter-spacing: 2px;
+	}
+
+	.create-tournament-btn {
 		background: #00ff00;
 		color: #000;
 		border: none;
@@ -726,31 +727,633 @@
 		font-weight: bold;
 		cursor: pointer;
 		letter-spacing: 1px;
-		transition: all 0.2s ease;
+		transition: all 0.2s;
 	}
 
-	.join-button:hover:not(:disabled) {
+	.create-tournament-btn:hover {
 		background: #33ff33;
 		transform: scale(1.05);
 	}
 
-	.join-button:disabled {
-		opacity: 0.6;
+	.tournament-grid {
+		display: grid;
+		grid-template-columns: 1fr 400px;
+		gap: 1px;
+		background: #111;
+		flex: 1;
+		overflow: hidden;
+	}
+
+	.tournaments-section {
+		background: #000;
+		padding: 20px;
+		overflow-y: auto;
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+		gap: 15px;
+		align-content: start;
+	}
+
+	.tournament-card {
+		background: #0a0a0a;
+		border: 2px solid #222;
+		padding: 15px;
+		cursor: pointer;
+		transition: all 0.3s;
+		position: relative;
+	}
+
+	.tournament-card:hover {
+		border-color: #ff9500;
+		background: #111;
+		transform: translateY(-2px);
+		box-shadow: 0 4px 12px rgba(255, 149, 0, 0.2);
+	}
+
+	.tournament-card.selected {
+		border-color: #ff9500;
+		background: #1a1a00;
+		box-shadow: 0 0 20px rgba(255, 149, 0, 0.3);
+	}
+
+	.card-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 15px;
+		padding-bottom: 10px;
+		border-bottom: 1px solid #333;
+	}
+
+	.tournament-id {
+		font-size: 13px;
+		font-weight: bold;
+		color: #ff9500;
+	}
+
+	.tournament-status {
+		font-size: 9px;
+		padding: 3px 8px;
+		font-weight: bold;
+	}
+
+	.card-body {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 12px;
+		margin-bottom: 12px;
+	}
+
+	.card-stat {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.stat-label {
+		font-size: 9px;
+		color: #666;
+	}
+
+	.stat-value {
+		font-size: 13px;
+		color: #fff;
+		font-weight: bold;
+	}
+
+	.stat-value.green { color: #00ff00; }
+	.stat-value.orange { color: #ff9500; }
+
+	.join-tournament-btn {
+		width: 100%;
+		background: #00ff00;
+		color: #000;
+		border: none;
+		padding: 10px;
+		font-family: 'Courier New', monospace;
+		font-size: 11px;
+		font-weight: bold;
+		cursor: pointer;
+		margin-top: 8px;
+		transition: all 0.2s;
+	}
+
+	.join-tournament-btn:hover:not(:disabled) {
+		background: #33ff33;
+	}
+
+	.join-tournament-btn:disabled {
+		opacity: 0.5;
 		cursor: not-allowed;
 	}
 
-	.join-hint {
-		color: #666;
-		font-size: 10px;
-		font-style: italic;
-	}
-
-	.joined-indicator {
+	.joined-badge {
 		background: #00ff00;
 		color: #000;
-		padding: 4px 8px;
+		text-align: center;
+		padding: 8px;
+		font-size: 11px;
+		font-weight: bold;
+		margin-top: 8px;
+	}
+
+	.go-terminal-btn {
+		width: 100%;
+		background: #ff9500;
+		color: #000;
+		border: none;
+		padding: 10px;
+		font-family: 'Courier New', monospace;
+		font-size: 11px;
+		font-weight: bold;
+		cursor: pointer;
+		margin-top: 8px;
+		transition: all 0.2s;
+	}
+
+	.go-terminal-btn:hover {
+		background: #ffaa33;
+		transform: translateX(2px);
+	}
+
+	.no-tournaments {
+		grid-column: 1 / -1;
+		text-align: center;
+		padding: 80px 20px;
+		background: linear-gradient(180deg, #000 0%, #0a0a0a 100%);
+		border: 1px dashed #333;
+		margin: 20px;
+	}
+
+	.empty-icon {
+		font-size: 48px;
+		color: #333;
+		margin-bottom: 20px;
+		opacity: 0.5;
+	}
+
+	.empty-title {
+		color: #ff9500;
+		font-size: 14px;
+		font-weight: bold;
+		letter-spacing: 2px;
+		margin-bottom: 12px;
+	}
+
+	.empty-hint {
+		font-size: 11px;
+		color: #666;
+		margin: 0;
+	}
+
+	.info-section {
+		background: #000;
+		overflow-y: auto;
+		overflow-x: hidden;
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+		max-width: 400px;
+		width: 100%;
+	}
+
+	.stats-panel {
+		background: #0a0a0a;
+		border-left: 1px solid #333;
+		overflow-x: hidden;
+		max-width: 100%;
+	}
+
+	.panel-header {
+		background: #1a1a1a;
+		padding: 10px 15px;
+		border-bottom: 2px solid #ff9500;
+		font-size: 11px;
+		font-weight: bold;
+		color: #ff9500;
+		letter-spacing: 1px;
+	}
+
+	.stats-grid {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 1px;
+		background: #111;
+		margin: 1px;
+	}
+
+	.stat-box {
+		background: #000;
+		padding: 15px;
+		text-align: center;
+	}
+
+	.stat-label {
+		font-size: 9px;
+		color: #666;
+		margin-bottom: 6px;
+	}
+
+	.stat-value {
+		font-size: 16px;
+		color: #fff;
+		font-weight: bold;
+	}
+
+	.stat-value.large {
+		font-size: 20px;
+	}
+
+	.stat-sublabel {
+		font-size: 10px;
+		color: #999;
+		margin-top: 4px;
+	}
+
+	.balances-grid {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 1px;
+		background: #111;
+		margin: 1px;
+	}
+
+	.balance-item {
+		background: #000;
+		padding: 10px 15px;
+		display: flex;
+		justify-content: space-between;
+		font-size: 11px;
+	}
+
+	.balance-item span:first-child {
+		color: #666;
+	}
+
+	.balance-value {
+		color: #fff;
+		font-weight: bold;
+	}
+
+	.trade-link {
+		display: block;
+		width: 100%;
+		text-align: center;
+		padding: 12px;
+		background: #1a1a00;
+		color: #ff9500;
+		text-decoration: none;
+		font-size: 11px;
+		font-weight: bold;
+		border: none;
+		border-top: 1px solid #333;
+		font-family: 'Courier New', monospace;
+		cursor: pointer;
+		transition: all 0.2s;
+	}
+
+	.trade-link:hover {
+		background: #2a2a00;
+	}
+
+	.leaderboard-panel {
+		background: #0a0a0a;
+		border-left: 1px solid #333;
+		flex: 1;
+		overflow-x: hidden;
+		max-width: 100%;
+	}
+
+	.leaderboard-table {
+		font-size: 11px;
+	}
+
+	.table-header {
+		display: grid;
+		grid-template-columns: 40px 100px 90px 100px 60px;
+		gap: 8px;
+		padding: 8px 12px;
+		background: #1a1a1a;
+		color: #666;
+		font-weight: bold;
+		border-bottom: 1px solid #ff9500;
+	}
+
+	.table-row {
+		display: grid;
+		grid-template-columns: 40px 100px 90px 100px 60px;
+		gap: 8px;
+		padding: 8px 12px;
+		border-bottom: 1px solid #111;
+		transition: background 0.2s;
+	}
+
+	.table-row:hover {
+		background: #0f0f0f;
+	}
+
+	.table-row.highlight {
+		background: #1a1a00;
+	}
+
+	.col-rank {
+		color: #ff9500;
+		font-weight: bold;
+	}
+
+	.col-rank.rank-1 { color: #ffaa00; }
+	.col-rank.rank-2 { color: #aaa; }
+	.col-rank.rank-3 { color: #cd7f32; }
+
+	.col-player {
+		color: #00ccff;
+	}
+
+	.green { color: #00ff00; }
+	.red { color: #ff0000; }
+
+	.no-data {
+		padding: 40px 20px;
+		text-align: center;
+		color: #666;
+		font-size: 11px;
+	}
+
+	.no-selection {
+		padding: 80px 20px;
+		text-align: center;
+		background: linear-gradient(180deg, #000 0%, #0a0a0a 100%);
+		border: 1px dashed #333;
+		margin: 20px;
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.no-selection .empty-icon {
+		font-size: 48px;
+		color: #333;
+		margin-bottom: 20px;
+		opacity: 0.5;
+	}
+
+	.no-selection .empty-title {
+		color: #ff9500;
+		font-size: 14px;
+		font-weight: bold;
+		letter-spacing: 2px;
+		margin-bottom: 12px;
+	}
+
+	.no-selection .empty-hint {
+		font-size: 11px;
+		color: #666;
+		margin: 0;
+	}
+
+	.admin-btn {
+		width: calc(100% - 2px);
+		margin: 1px;
+		background: #333;
+		color: #fff;
+		border: 1px solid #666;
+		padding: 10px;
+		font-family: 'Courier New', monospace;
+		font-size: 10px;
+		cursor: pointer;
+		transition: all 0.2s;
+	}
+
+	.admin-btn:hover:not(:disabled) {
+		background: #444;
+	}
+
+	.prize-footer {
+		background: #0a0a0a;
+		border-top: 2px solid #ff9500;
+		padding: 15px 20px;
+	}
+
+	.prize-header {
+		font-size: 11px;
+		font-weight: bold;
+		color: #ff9500;
+		letter-spacing: 1px;
+		margin-bottom: 12px;
+	}
+
+	.prize-grid {
+		display: grid;
+		grid-template-columns: repeat(4, 1fr);
+		gap: 10px;
+		margin-bottom: 10px;
+	}
+
+	.prize-box {
+		background: #000;
+		border: 1px solid #333;
+		padding: 12px;
+		text-align: center;
+	}
+
+	.prize-rank {
 		font-size: 10px;
 		font-weight: bold;
+		margin-bottom: 6px;
+	}
+
+	.prize-box.gold .prize-rank { color: #ffaa00; }
+	.prize-box.silver .prize-rank { color: #aaa; }
+	.prize-box.bronze .prize-rank { color: #cd7f32; }
+	.prize-box.treasury .prize-rank { color: #666; }
+
+	.prize-percent {
+		font-size: 16px;
+		font-weight: bold;
+		color: #fff;
+		margin-bottom: 4px;
+	}
+
+	.prize-amount {
+		font-size: 11px;
+		color: #999;
+	}
+
+	.prize-info {
+		text-align: center;
+		font-size: 9px;
+		color: #666;
+		padding-top: 10px;
+		border-top: 1px solid #222;
+	}
+
+	/* Modal Styles */
+	.modal-overlay {
+		position: fixed;
+		top: 0;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		background: rgba(0, 0, 0, 0.85);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		z-index: 1000;
+	}
+
+	.modal-content {
+		background: #1a1a1a;
+		border: 2px solid #ff9500;
+		width: 90%;
+		max-width: 500px;
+		box-shadow: 0 0 40px rgba(255, 149, 0, 0.3);
+	}
+
+	.modal-header {
+		background: #000;
+		padding: 15px 20px;
+		border-bottom: 2px solid #ff9500;
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+	}
+
+	.modal-header h2 {
+		color: #ff9500;
+		font-size: 14px;
+		letter-spacing: 2px;
+		margin: 0;
+	}
+
+	.modal-close {
+		background: none;
+		border: none;
+		color: #fff;
+		font-size: 24px;
+		cursor: pointer;
+		padding: 0;
+		width: 30px;
+		height: 30px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.modal-close:hover {
+		color: #ff9500;
+	}
+
+	.modal-body {
+		padding: 20px;
+	}
+
+	.form-group {
+		margin-bottom: 20px;
+	}
+
+	.form-group label {
+		display: block;
+		color: #ff9500;
+		font-size: 10px;
+		margin-bottom: 6px;
 		letter-spacing: 1px;
+	}
+
+	.form-group input {
+		width: 100%;
+		background: #000;
+		border: 1px solid #333;
+		color: #fff;
+		padding: 10px;
+		font-family: 'Courier New', monospace;
+		font-size: 13px;
+	}
+
+	.form-group input:focus {
+		outline: none;
+		border-color: #ff9500;
+	}
+
+	.form-hint {
+		display: block;
+		color: #666;
+		font-size: 9px;
+		margin-top: 4px;
+	}
+
+	.input-group {
+		display: flex;
+		gap: 8px;
+	}
+
+	.input-group input {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.input-group select {
+		background: #000;
+		border: 1px solid #333;
+		color: #ff9500;
+		padding: 10px;
+		font-family: 'Courier New', monospace;
+		font-size: 13px;
+		cursor: pointer;
+		min-width: 110px;
+	}
+
+	.input-group select:focus {
+		outline: none;
+		border-color: #ff9500;
+	}
+
+	.input-group select option {
+		background: #000;
+		color: #fff;
+	}
+
+	.modal-footer {
+		background: #000;
+		padding: 15px 20px;
+		border-top: 1px solid #333;
+		display: flex;
+		justify-content: flex-end;
+		gap: 10px;
+	}
+
+	.modal-cancel {
+		background: #333;
+		color: #fff;
+		border: 1px solid #666;
+		padding: 10px 20px;
+		font-family: 'Courier New', monospace;
+		font-size: 11px;
+		cursor: pointer;
+	}
+
+	.modal-cancel:hover {
+		background: #444;
+	}
+
+	.modal-submit {
+		background: #00ff00;
+		color: #000;
+		border: none;
+		padding: 10px 20px;
+		font-family: 'Courier New', monospace;
+		font-size: 11px;
+		font-weight: bold;
+		cursor: pointer;
+	}
+
+	.modal-submit:hover:not(:disabled) {
+		background: #33ff33;
+	}
+
+	.modal-submit:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 </style>

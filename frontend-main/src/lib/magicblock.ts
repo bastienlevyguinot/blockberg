@@ -6,7 +6,7 @@ export const MAGICBLOCK_RPC = 'https://rpc.magicblock.app/devnet/';
 export const SOLANA_RPC = 'https://api.devnet.solana.com';
 
 // Paper Trading Program ID from the contract
-export const PAPER_TRADING_PROGRAM_ID = new PublicKey('ENpbjfPxXx9fLhLDcqbLsHmo25LRU4fW9RXFfrqbKbmo');
+export const PAPER_TRADING_PROGRAM_ID = new PublicKey('GTyA9zS7YrRJ7LQCqeKAYZa4yL2CSCaH6SmEALEWAXAk');
 
 export const COMPONENT_IDS = {
 	TRADING_ACCOUNT: new PublicKey('3PDo9AKeLhU6hcUC7gft3PKQuotH4624mcevqdSiyTPS'),
@@ -29,6 +29,40 @@ export const TRADING_PAIRS = {
 	AVAX: 3,
 	LINK: 4,
 };
+
+export enum TournamentStatus {
+	Pending = 0,    // Registration open
+	Active = 1,     // Trading active
+	Ended = 2,      // Trading ended, awaiting settlement
+	Settled = 3,    // Prizes distributed
+}
+
+export interface Tournament {
+	pubkey: string;
+	id: number;
+	creator: string;
+	entryFee: number;      // in SOL
+	prizePool: number;     // in SOL
+	cooldownEnd: Date;
+	endTime: Date;
+	status: TournamentStatus;
+	participantCount: number;
+	createdAt: Date;
+}
+
+export interface TournamentParticipant {
+	pubkey: string;
+	tournament: string;
+	user: string;
+	usdtBalance: number;
+	solBalance: number;
+	btcBalance: number;
+	ethBalance: number;
+	avaxBalance: number;
+	linkBalance: number;
+	totalPositions: number;
+	joinedAt: Date;
+}
 
 export const TOKEN_DECIMALS = {
 	// token_in (quote tokens - typically USDT)
@@ -1969,6 +2003,689 @@ export class MagicBlockClient {
 			programId: SYSTEM_IDS.SETTLE_COMPETITION,
 			data: Buffer.from(JSON.stringify(args)),
 		};
+	}
+
+	// ============= TOURNAMENT METHODS =============
+
+	// Get tournament PDA
+	getTournamentPDA(tournamentId: number): [PublicKey, number] {
+		const idBuffer = Buffer.allocUnsafe(8);
+		idBuffer.writeBigUInt64LE(BigInt(tournamentId));
+		return PublicKey.findProgramAddressSync(
+			[Buffer.from('tournament'), idBuffer],
+			PAPER_TRADING_PROGRAM_ID
+		);
+	}
+
+	// Get participant PDA
+	getParticipantPDA(tournamentPubkey: PublicKey, userPubkey: PublicKey): [PublicKey, number] {
+		return PublicKey.findProgramAddressSync(
+			[Buffer.from('participant'), tournamentPubkey.toBuffer(), userPubkey.toBuffer()],
+			PAPER_TRADING_PROGRAM_ID
+		);
+	}
+
+	// Get tournament position PDA
+	getTournamentPositionPDA(
+		tournamentPubkey: PublicKey,
+		userPubkey: PublicKey,
+		pairIndex: number,
+		positionId: number
+	): [PublicKey, number] {
+		const positionIdBuffer = Buffer.allocUnsafe(8);
+		positionIdBuffer.writeBigUInt64LE(BigInt(positionId));
+		return PublicKey.findProgramAddressSync(
+			[
+				Buffer.from('tournament_position'),
+				tournamentPubkey.toBuffer(),
+				userPubkey.toBuffer(),
+				Buffer.from([pairIndex]),
+				positionIdBuffer
+			],
+			PAPER_TRADING_PROGRAM_ID
+		);
+	}
+
+	// Create a new tournament
+	async createTournament(
+		tournamentId: number,
+		entryFeeSOL: number,
+		durationMinutes: number,
+		cooldownMinutes: number
+	): Promise<string> {
+		const currentWallet = this.getCurrentWallet();
+		if (!currentWallet) {
+			throw new Error('Wallet not connected');
+		}
+
+		const [tournamentPDA] = this.getTournamentPDA(tournamentId);
+
+		// Check if tournament already exists
+		const existing = await this.connection.getAccountInfo(tournamentPDA);
+		if (existing) {
+			throw new Error('Tournament with this ID already exists');
+		}
+
+		const entryFeeLamports = Math.floor(entryFeeSOL * LAMPORTS_PER_SOL);
+		const durationSeconds = durationMinutes * 60;
+		const cooldownSeconds = cooldownMinutes * 60;
+
+		// Create discriminator
+		const methodName = 'global:create_tournament';
+		const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(methodName));
+		const discriminator = new Uint8Array(hash).slice(0, 8);
+
+		// Create instruction data: discriminator + tournament_id(u64) + entry_fee(u64) + duration_seconds(i64) + cooldown_seconds(i64)
+		const instructionData = Buffer.alloc(8 + 8 + 8 + 8 + 8);
+		Buffer.from(discriminator).copy(instructionData, 0);
+		instructionData.writeBigUInt64LE(BigInt(tournamentId), 8);
+		instructionData.writeBigUInt64LE(BigInt(entryFeeLamports), 16);
+		instructionData.writeBigInt64LE(BigInt(durationSeconds), 24);
+		instructionData.writeBigInt64LE(BigInt(cooldownSeconds), 32);
+
+		const instruction = new TransactionInstruction({
+			keys: [
+				{ pubkey: tournamentPDA, isSigner: false, isWritable: true },
+				{ pubkey: currentWallet.publicKey, isSigner: true, isWritable: true },
+				{ pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+			],
+			programId: PAPER_TRADING_PROGRAM_ID,
+			data: instructionData
+		});
+
+		const transaction = new Transaction().add(instruction);
+		const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+		transaction.recentBlockhash = latestBlockhash.blockhash;
+		transaction.feePayer = currentWallet.publicKey;
+
+		const signedTx = await currentWallet.signTransaction!(transaction);
+		const signature = await this.connection.sendRawTransaction(signedTx.serialize(), {
+			skipPreflight: false,
+			preflightCommitment: 'confirmed'
+		});
+
+		await this.connection.confirmTransaction({
+			signature,
+			blockhash: latestBlockhash.blockhash,
+			lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+		}, 'confirmed');
+
+		return signature;
+	}
+
+	// Enter a tournament
+	async enterTournament(tournamentId: number): Promise<string> {
+		const currentWallet = this.getCurrentWallet();
+		if (!currentWallet) {
+			throw new Error('Wallet not connected');
+		}
+
+		const [tournamentPDA] = this.getTournamentPDA(tournamentId);
+		const [participantPDA] = this.getParticipantPDA(tournamentPDA, currentWallet.publicKey);
+
+		// Check if already joined
+		const existing = await this.connection.getAccountInfo(participantPDA);
+		if (existing) {
+			throw new Error('Already joined this tournament');
+		}
+
+		// Create discriminator
+		const methodName = 'global:enter_tournament';
+		const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(methodName));
+		const discriminator = new Uint8Array(hash).slice(0, 8);
+
+		const instructionData = Buffer.from(discriminator);
+
+		const instruction = new TransactionInstruction({
+			keys: [
+				{ pubkey: tournamentPDA, isSigner: false, isWritable: true },
+				{ pubkey: participantPDA, isSigner: false, isWritable: true },
+				{ pubkey: currentWallet.publicKey, isSigner: true, isWritable: true },
+				{ pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+			],
+			programId: PAPER_TRADING_PROGRAM_ID,
+			data: instructionData
+		});
+
+		const transaction = new Transaction().add(instruction);
+		const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+		transaction.recentBlockhash = latestBlockhash.blockhash;
+		transaction.feePayer = currentWallet.publicKey;
+
+		const signedTx = await currentWallet.signTransaction!(transaction);
+		const signature = await this.connection.sendRawTransaction(signedTx.serialize(), {
+			skipPreflight: false,
+			preflightCommitment: 'confirmed'
+		});
+
+		await this.connection.confirmTransaction({
+			signature,
+			blockhash: latestBlockhash.blockhash,
+			lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+		}, 'confirmed');
+
+		return signature;
+	}
+
+	// Start a tournament (anyone can call after cooldown ends)
+	async startTournament(tournamentId: number): Promise<string> {
+		const currentWallet = this.getCurrentWallet();
+		if (!currentWallet) {
+			throw new Error('Wallet not connected');
+		}
+
+		const [tournamentPDA] = this.getTournamentPDA(tournamentId);
+
+		const methodName = 'global:start_tournament';
+		const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(methodName));
+		const discriminator = new Uint8Array(hash).slice(0, 8);
+
+		const instructionData = Buffer.from(discriminator);
+
+		const instruction = new TransactionInstruction({
+			keys: [
+				{ pubkey: tournamentPDA, isSigner: false, isWritable: true },
+				{ pubkey: currentWallet.publicKey, isSigner: true, isWritable: false }
+			],
+			programId: PAPER_TRADING_PROGRAM_ID,
+			data: instructionData
+		});
+
+		const transaction = new Transaction().add(instruction);
+		const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+		transaction.recentBlockhash = latestBlockhash.blockhash;
+		transaction.feePayer = currentWallet.publicKey;
+
+		const signedTx = await currentWallet.signTransaction!(transaction);
+		const signature = await this.connection.sendRawTransaction(signedTx.serialize(), {
+			skipPreflight: false,
+			preflightCommitment: 'confirmed'
+		});
+
+		await this.connection.confirmTransaction({
+			signature,
+			blockhash: latestBlockhash.blockhash,
+			lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+		}, 'confirmed');
+
+		return signature;
+	}
+
+	// Tournament buy - buy token with USDT balance
+	async tournamentBuy(
+		tournamentId: number,
+		pairIndex: number,
+		tokenAmount: number,
+		currentPrice: number
+	): Promise<string> {
+		const currentWallet = this.getCurrentWallet();
+		if (!currentWallet) {
+			throw new Error('Wallet not connected');
+		}
+
+		const [tournamentPDA] = this.getTournamentPDA(tournamentId);
+		const [participantPDA] = this.getParticipantPDA(tournamentPDA, currentWallet.publicKey);
+
+		// All tokens use 8 decimals for token_out in tournament
+		const amountTokenOut = Math.floor(tokenAmount * 1e8);
+		const priceScaled = Math.floor(currentPrice * 1e6);
+
+		const methodName = 'global:tournament_buy';
+		const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(methodName));
+		const discriminator = new Uint8Array(hash).slice(0, 8);
+
+		// pair_index(u8) + amount_token_out(u64) + price(u64)
+		const instructionData = Buffer.alloc(8 + 1 + 8 + 8);
+		Buffer.from(discriminator).copy(instructionData, 0);
+		instructionData.writeUInt8(pairIndex, 8);
+		instructionData.writeBigUInt64LE(BigInt(amountTokenOut), 9);
+		instructionData.writeBigUInt64LE(BigInt(priceScaled), 17);
+
+		const instruction = new TransactionInstruction({
+			keys: [
+				{ pubkey: tournamentPDA, isSigner: false, isWritable: false },
+				{ pubkey: participantPDA, isSigner: false, isWritable: true },
+				{ pubkey: currentWallet.publicKey, isSigner: true, isWritable: false }
+			],
+			programId: PAPER_TRADING_PROGRAM_ID,
+			data: instructionData
+		});
+
+		const transaction = new Transaction().add(instruction);
+		const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+		transaction.recentBlockhash = latestBlockhash.blockhash;
+		transaction.feePayer = currentWallet.publicKey;
+
+		const signedTx = await currentWallet.signTransaction!(transaction);
+		const signature = await this.connection.sendRawTransaction(signedTx.serialize(), {
+			skipPreflight: false,
+			preflightCommitment: 'confirmed'
+		});
+
+		await this.connection.confirmTransaction({
+			signature,
+			blockhash: latestBlockhash.blockhash,
+			lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+		}, 'confirmed');
+
+		return signature;
+	}
+
+	// Tournament sell - sell token for USDT
+	async tournamentSell(
+		tournamentId: number,
+		pairIndex: number,
+		tokenAmount: number,
+		currentPrice: number
+	): Promise<string> {
+		const currentWallet = this.getCurrentWallet();
+		if (!currentWallet) {
+			throw new Error('Wallet not connected');
+		}
+
+		const [tournamentPDA] = this.getTournamentPDA(tournamentId);
+		const [participantPDA] = this.getParticipantPDA(tournamentPDA, currentWallet.publicKey);
+
+		const amountTokenOut = Math.floor(tokenAmount * 1e8);
+		const priceScaled = Math.floor(currentPrice * 1e6);
+
+		const methodName = 'global:tournament_sell';
+		const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(methodName));
+		const discriminator = new Uint8Array(hash).slice(0, 8);
+
+		const instructionData = Buffer.alloc(8 + 1 + 8 + 8);
+		Buffer.from(discriminator).copy(instructionData, 0);
+		instructionData.writeUInt8(pairIndex, 8);
+		instructionData.writeBigUInt64LE(BigInt(amountTokenOut), 9);
+		instructionData.writeBigUInt64LE(BigInt(priceScaled), 17);
+
+		const instruction = new TransactionInstruction({
+			keys: [
+				{ pubkey: tournamentPDA, isSigner: false, isWritable: false },
+				{ pubkey: participantPDA, isSigner: false, isWritable: true },
+				{ pubkey: currentWallet.publicKey, isSigner: true, isWritable: false }
+			],
+			programId: PAPER_TRADING_PROGRAM_ID,
+			data: instructionData
+		});
+
+		const transaction = new Transaction().add(instruction);
+		const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+		transaction.recentBlockhash = latestBlockhash.blockhash;
+		transaction.feePayer = currentWallet.publicKey;
+
+		const signedTx = await currentWallet.signTransaction!(transaction);
+		const signature = await this.connection.sendRawTransaction(signedTx.serialize(), {
+			skipPreflight: false,
+			preflightCommitment: 'confirmed'
+		});
+
+		await this.connection.confirmTransaction({
+			signature,
+			blockhash: latestBlockhash.blockhash,
+			lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+		}, 'confirmed');
+
+		return signature;
+	}
+
+	// Fetch all tournaments
+	async fetchTournaments(): Promise<Tournament[]> {
+		try {
+			console.log('[TOURNAMENTS] Fetching all program accounts...');
+
+			// Fetch all accounts owned by the program (no size filter)
+			const accounts = await this.connection.getProgramAccounts(PAPER_TRADING_PROGRAM_ID);
+
+			console.log(`[TOURNAMENTS] Found ${accounts.length} total program accounts`);
+
+			const tournaments: Tournament[] = [];
+
+			for (const accountInfo of accounts) {
+				try {
+					const data = accountInfo.account.data;
+					console.log(`[TOURNAMENTS] Checking account ${accountInfo.pubkey.toBase58()}, data length: ${data.length}`);
+
+					// Skip if data is too small to be a tournament
+					if (data.length < 90) {
+						console.log(`[TOURNAMENTS] Skipping - too small`);
+						continue;
+					}
+
+					const dataView = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+					let offset = 8; // Skip discriminator
+
+					// Check if we can read all required fields
+					if (data.length < offset + 8 + 32 + 8 + 8 + 8 + 8 + 1 + 4 + 8) {
+						console.log(`[TOURNAMENTS] Skipping - insufficient data for tournament structure`);
+						continue;
+					}
+
+					const id = Number(dataView.getBigUint64(offset, true));
+					offset += 8;
+
+					const creatorBytes = data.slice(offset, offset + 32);
+					const creator = new PublicKey(creatorBytes).toBase58();
+					offset += 32;
+
+					const entryFee = Number(dataView.getBigUint64(offset, true)) / LAMPORTS_PER_SOL;
+					offset += 8;
+
+					const prizePool = Number(dataView.getBigUint64(offset, true)) / LAMPORTS_PER_SOL;
+					offset += 8;
+
+					const cooldownEnd = new Date(Number(dataView.getBigInt64(offset, true)) * 1000);
+					offset += 8;
+
+					const endTime = new Date(Number(dataView.getBigInt64(offset, true)) * 1000);
+					offset += 8;
+
+					const status = data[offset] as TournamentStatus;
+					offset += 1;
+
+					const participantCount = dataView.getUint32(offset, true);
+					offset += 4;
+
+					const createdAt = new Date(Number(dataView.getBigInt64(offset, true)) * 1000);
+					offset += 8;
+
+					// Validate that this looks like a tournament (reasonable values)
+					if (status > 3 || participantCount > 100000) {
+						console.log(`[TOURNAMENTS] Skipping - invalid status or participant count`);
+						continue;
+					}
+
+					console.log(`[TOURNAMENTS] ✓ Parsed tournament #${id}:`, {
+						pubkey: accountInfo.pubkey.toBase58(),
+						id,
+						creator,
+						entryFee,
+						prizePool,
+						status,
+						participantCount,
+						dataLength: data.length
+					});
+
+					tournaments.push({
+						pubkey: accountInfo.pubkey.toBase58(),
+						id,
+						creator,
+						entryFee,
+						prizePool,
+						cooldownEnd,
+						endTime,
+						status,
+						participantCount,
+						createdAt
+					});
+				} catch (parseError) {
+					console.log('[TOURNAMENTS] Error parsing account:', accountInfo.pubkey.toBase58(), parseError);
+				}
+			}
+
+			console.log(`[TOURNAMENTS] Successfully parsed ${tournaments.length} tournaments out of ${accounts.length} total accounts`);
+
+			// Sort by created time descending
+			tournaments.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+
+			return tournaments;
+		} catch (error) {
+			console.error('[TOURNAMENTS] Error fetching tournaments:', error);
+			return [];
+		}
+	}
+
+	// Fetch single tournament data
+	async fetchTournamentById(tournamentId: number): Promise<Tournament | null> {
+		try {
+			const [tournamentPDA] = this.getTournamentPDA(tournamentId);
+			console.log(`[TOURNAMENT] Fetching tournament #${tournamentId}, PDA: ${tournamentPDA.toBase58()}`);
+
+			const accountInfo = await this.connection.getAccountInfo(tournamentPDA);
+
+			if (!accountInfo) {
+				console.log(`[TOURNAMENT] Account not found for tournament #${tournamentId}`);
+				return null;
+			}
+
+			console.log(`[TOURNAMENT] Account found, data length: ${accountInfo.data.length}`);
+
+			const data = accountInfo.data;
+			const dataView = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+			let offset = 8; // Skip discriminator
+
+			const id = Number(dataView.getBigUint64(offset, true));
+			offset += 8;
+
+			const creatorBytes = data.slice(offset, offset + 32);
+			const creator = new PublicKey(creatorBytes).toBase58();
+			offset += 32;
+
+			const entryFee = Number(dataView.getBigUint64(offset, true)) / LAMPORTS_PER_SOL;
+			offset += 8;
+
+			const prizePool = Number(dataView.getBigUint64(offset, true)) / LAMPORTS_PER_SOL;
+			offset += 8;
+
+			const cooldownEnd = new Date(Number(dataView.getBigInt64(offset, true)) * 1000);
+			offset += 8;
+
+			const endTime = new Date(Number(dataView.getBigInt64(offset, true)) * 1000);
+			offset += 8;
+
+			const status = data[offset] as TournamentStatus;
+			offset += 1;
+
+			const participantCount = dataView.getUint32(offset, true);
+			offset += 4;
+
+			const createdAt = new Date(Number(dataView.getBigInt64(offset, true)) * 1000);
+
+			console.log(`[TOURNAMENT] Successfully parsed tournament #${id}:`, {
+				id,
+				creator,
+				entryFee,
+				prizePool,
+				status,
+				participantCount
+			});
+
+			return {
+				pubkey: tournamentPDA.toBase58(),
+				id,
+				creator,
+				entryFee,
+				prizePool,
+				cooldownEnd,
+				endTime,
+				status,
+				participantCount,
+				createdAt
+			};
+		} catch (error) {
+			console.error('[TOURNAMENT] Error fetching tournament:', error);
+			return null;
+		}
+	}
+
+	// Fetch participant data for current user
+	async fetchTournamentParticipant(tournamentId: number): Promise<TournamentParticipant | null> {
+		const currentWallet = this.getCurrentWallet();
+		if (!currentWallet) {
+			return null;
+		}
+
+		try {
+			const [tournamentPDA] = this.getTournamentPDA(tournamentId);
+			const [participantPDA] = this.getParticipantPDA(tournamentPDA, currentWallet.publicKey);
+
+			const accountInfo = await this.connection.getAccountInfo(participantPDA);
+
+			if (!accountInfo) {
+				return null;
+			}
+
+			const data = accountInfo.data;
+			const dataView = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+			let offset = 8; // Skip discriminator
+
+			const tournamentBytes = data.slice(offset, offset + 32);
+			const tournament = new PublicKey(tournamentBytes).toBase58();
+			offset += 32;
+
+			const userBytes = data.slice(offset, offset + 32);
+			const user = new PublicKey(userBytes).toBase58();
+			offset += 32;
+
+			const usdtBalance = Number(dataView.getBigUint64(offset, true)) / 1e6;
+			offset += 8;
+
+			const solBalance = Number(dataView.getBigUint64(offset, true)) / 1e8;
+			offset += 8;
+
+			const btcBalance = Number(dataView.getBigUint64(offset, true)) / 1e8;
+			offset += 8;
+
+			const ethBalance = Number(dataView.getBigUint64(offset, true)) / 1e8;
+			offset += 8;
+
+			const avaxBalance = Number(dataView.getBigUint64(offset, true)) / 1e8;
+			offset += 8;
+
+			const linkBalance = Number(dataView.getBigUint64(offset, true)) / 1e8;
+			offset += 8;
+
+			const totalPositions = Number(dataView.getBigUint64(offset, true));
+			offset += 8;
+
+			const joinedAt = new Date(Number(dataView.getBigInt64(offset, true)) * 1000);
+
+			return {
+				pubkey: participantPDA.toBase58(),
+				tournament,
+				user,
+				usdtBalance,
+				solBalance,
+				btcBalance,
+				ethBalance,
+				avaxBalance,
+				linkBalance,
+				totalPositions,
+				joinedAt
+			};
+		} catch (error) {
+			console.error('Error fetching participant:', error);
+			return null;
+		}
+	}
+
+	// Check if user has joined a tournament
+	async hasJoinedTournament(tournamentId: number): Promise<boolean> {
+		const participant = await this.fetchTournamentParticipant(tournamentId);
+		return participant !== null;
+	}
+
+	// Fetch tournament leaderboard
+	async fetchTournamentLeaderboard(tournamentId: number, currentPrices?: Record<string, number>): Promise<any[]> {
+		try {
+			const [tournamentPDA] = this.getTournamentPDA(tournamentId);
+
+			console.log(`[LEADERBOARD] Fetching participants for tournament ${tournamentId}, PDA: ${tournamentPDA.toBase58()}`);
+
+			// Fetch accounts that match the tournament PDA at offset 8
+			const accounts = await this.connection.getProgramAccounts(PAPER_TRADING_PROGRAM_ID, {
+				filters: [
+					{
+						memcmp: {
+							offset: 8, // After discriminator
+							bytes: tournamentPDA.toBase58()
+						}
+					}
+				]
+			});
+
+			console.log(`[LEADERBOARD] Found ${accounts.length} accounts with matching tournament PDA`);
+
+			const leaderboard = [];
+
+			for (const accountInfo of accounts) {
+				try {
+					const data = accountInfo.account.data;
+					console.log(`[LEADERBOARD] Parsing participant account ${accountInfo.pubkey.toBase58()}, data length: ${data.length}`);
+
+					const dataView = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+					let offset = 8 + 32; // Skip discriminator and tournament pubkey
+
+					const userBytes = data.slice(offset, offset + 32);
+					const user = new PublicKey(userBytes).toBase58();
+					offset += 32;
+
+					const usdtBalance = Number(dataView.getBigUint64(offset, true)) / 1e6;
+					offset += 8;
+
+					const solBalance = Number(dataView.getBigUint64(offset, true)) / 1e8;
+					offset += 8;
+
+					const btcBalance = Number(dataView.getBigUint64(offset, true)) / 1e8;
+					offset += 8;
+
+					const ethBalance = Number(dataView.getBigUint64(offset, true)) / 1e8;
+					offset += 8;
+
+					const avaxBalance = Number(dataView.getBigUint64(offset, true)) / 1e8;
+					offset += 8;
+
+					const linkBalance = Number(dataView.getBigUint64(offset, true)) / 1e8;
+					offset += 8;
+
+					const totalPositions = Number(dataView.getBigUint64(offset, true));
+
+					// Calculate total portfolio value
+					let totalValue = usdtBalance;
+					if (currentPrices) {
+						totalValue += solBalance * (currentPrices['SOL'] || 0);
+						totalValue += btcBalance * (currentPrices['BTC'] || 0);
+						totalValue += ethBalance * (currentPrices['ETH'] || 0);
+						totalValue += avaxBalance * (currentPrices['AVAX'] || 0);
+						totalValue += linkBalance * (currentPrices['LINK'] || 0);
+					}
+
+					const pnl = totalValue - 10000; // Starting balance was 10k
+
+					leaderboard.push({
+						address: user.substring(0, 8),
+						fullAddress: user,
+						balance: totalValue,
+						pnl,
+						trades: totalPositions,
+						usdtBalance,
+						solBalance,
+						btcBalance,
+						ethBalance,
+						avaxBalance,
+						linkBalance
+					});
+				} catch (parseError) {
+					console.error('Error parsing participant:', parseError);
+				}
+			}
+
+			// Sort by P&L descending
+			leaderboard.sort((a, b) => b.pnl - a.pnl);
+
+			// Add rank
+			return leaderboard.map((entry, index) => ({
+				...entry,
+				rank: index + 1
+			}));
+		} catch (error) {
+			console.error('Error fetching tournament leaderboard:', error);
+			return [];
+		}
 	}
 }
 

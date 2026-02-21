@@ -3,6 +3,7 @@
 	import { HermesClient } from '@pythnetwork/hermes-client';
 	import { magicBlockClient, PositionDirection, TRADING_PAIRS } from '$lib/magicblock';
 	import { walletStore } from '$lib/wallet/stores';
+	import { tradingModeStore, type TradingContext } from '$lib/stores/tradingMode';
 	import WalletButton from '$lib/wallet/WalletButton.svelte';
 	import Toast from '$lib/toast/Toast.svelte';
 	import { toastStore } from '$lib/toast/store';
@@ -75,13 +76,44 @@
 	const FETCH_COOLDOWN = 5000;
 	let mockTokenBalances: { [pairIndex: number]: { tokenInBalance: number; tokenOutBalance: number; totalPositions: number } } = {};
 
+	// Trading mode context
+	let tradingContext: TradingContext = { mode: 'regular' };
+	let tournamentParticipantData: any = null;
+
+	// Subscribe to trading mode changes
+	tradingModeStore.subscribe(context => {
+		tradingContext = context;
+		console.log('[TRADING MODE] Mode changed:', context);
+		// Refresh balances when mode changes
+		if (connectedWallet?.connected) {
+			refreshTradingData();
+		}
+	});
+
+	// Function to refresh trading data based on mode
+	async function refreshTradingData() {
+		if (!connectedWallet?.connected) return;
+
+		if (tradingContext.mode === 'tournament' && tradingContext.tournamentId) {
+			// Fetch tournament participant data
+			console.log('[TRADING] Fetching tournament data for tournament #', tradingContext.tournamentId);
+			tournamentParticipantData = await magicBlockClient.fetchTournamentParticipant(tradingContext.tournamentId);
+			console.log('[TRADING] Tournament participant data:', tournamentParticipantData);
+			updateAvailableBalance();
+		} else {
+			// Regular mode - existing logic
+			tournamentParticipantData = null;
+			await updateWalletStatus();
+		}
+	}
+
 	// Subscribe to wallet changes
 	walletStore.subscribe(wallet => {
 		connectedWallet = wallet;
 		if (wallet.connected && wallet.publicKey) {
 			walletAddress = wallet.publicKey.toBase58();
 			magicBlockClient.setConnectedWallet(wallet.adapter);
-			updateWalletStatus();
+			refreshTradingData();
 		} else {
 			walletAddress = '';
 			magicBlockClient.setConnectedWallet(null);
@@ -89,6 +121,7 @@
 			accountsInitialized = {};
 			availableBalance = { tokenIn: 0, tokenOut: 0 };
 			magicBlockStatus = 'Ready - Connect wallet to trade';
+			tournamentParticipantData = null;
 		}
 	});
 
@@ -354,6 +387,25 @@
 			return;
 		}
 
+		// Tournament mode - use tournament participant balances
+		if (tradingContext.mode === 'tournament' && tournamentParticipantData) {
+			const tokenBalanceMap: Record<string, number> = {
+				'SOL': tournamentParticipantData.solBalance,
+				'BTC': tournamentParticipantData.btcBalance,
+				'ETH': tournamentParticipantData.ethBalance,
+				'AVAX': tournamentParticipantData.avaxBalance,
+				'LINK': tournamentParticipantData.linkBalance
+			};
+
+			availableBalance = {
+				tokenIn: tournamentParticipantData.usdtBalance,
+				tokenOut: tokenBalanceMap[selectedTab] || 0
+			};
+			console.log('[TRADING] Tournament balance updated:', availableBalance);
+			return;
+		}
+
+		// Regular mode - existing logic
 		const currentPairIndex = TRADING_PAIRS[selectedTab];
 		if (mockTokenBalances[currentPairIndex]) {
 			const lockedUSDT = onChainPositions
@@ -473,14 +525,41 @@
 			try {
 				magicBlockStatus = `${action}...`;
 
-				const txSig = await magicBlockClient.executeSpotTrade(
-					selectedTab,
-					action,
-					currentPrice,
-					tokenAmount
-				);
+				let txSig: string;
 
-				magicBlockStatus = `${action} complete`;
+				// Tournament mode - use tournament trading instructions
+				if (tradingContext.mode === 'tournament' && tradingContext.tournamentId) {
+					console.log('[TRADING] Executing tournament', action, 'for', selectedTab);
+					const pairIndex = TRADING_PAIRS[selectedTab];
+
+					if (action === 'BUY') {
+						txSig = await magicBlockClient.tournamentBuy(
+							tradingContext.tournamentId,
+							pairIndex,
+							tokenAmount,
+							currentPrice
+						);
+					} else {
+						txSig = await magicBlockClient.tournamentSell(
+							tradingContext.tournamentId,
+							pairIndex,
+							tokenAmount,
+							currentPrice
+						);
+					}
+
+					magicBlockStatus = `Tournament ${action} complete`;
+				} else {
+					// Regular mode - use regular spot trading
+					txSig = await magicBlockClient.executeSpotTrade(
+						selectedTab,
+						action,
+						currentPrice,
+						tokenAmount
+					);
+
+					magicBlockStatus = `${action} complete`;
+				}
 
 				// Show success toast
 				toastStore.success(
@@ -488,14 +567,24 @@
 					`Successfully ${action === 'BUY' ? 'bought' : 'sold'} ${tokenAmount} ${selectedTab} at $${currentPrice.toFixed(2)}`
 				);
 
-				// Immediate refresh
-				await updateWalletStatus();
-				updateAvailableBalance();
+				// Refresh data based on mode
+				if (tradingContext.mode === 'tournament' && tradingContext.tournamentId) {
+					// Refresh tournament participant data
+					await refreshTradingData();
+				} else {
+					// Refresh regular wallet status
+					await updateWalletStatus();
+					updateAvailableBalance();
+				}
 
 				// Additional refresh after delay
 				setTimeout(async () => {
-					await updateWalletStatus();
-					updateAvailableBalance();
+					if (tradingContext.mode === 'tournament') {
+						await refreshTradingData();
+					} else {
+						await updateWalletStatus();
+						updateAvailableBalance();
+					}
 				}, 1000);
 			} catch (error: any) {
 				console.error('Trade error:', error);
@@ -823,9 +912,21 @@
 				{#if walletBalance < 0.1}
 					<button class="airdrop-btn" on:click={requestAirdrop}>AIRDROP</button>
 				{/if}
-				{#if Object.keys(accountsInitialized).length === 0 || Object.values(accountsInitialized).some(initialized => !initialized)}
+				{#if tradingContext.mode !== 'tournament' && (Object.keys(accountsInitialized).length === 0 || Object.values(accountsInitialized).some(initialized => !initialized))}
 					<button class="initialize-btn" on:click={initializeAllAccounts}>INITIALIZE</button>
 				{/if}
+			{/if}
+		</div>
+		<div class="trading-mode-indicator" class:tournament={tradingContext.mode === 'tournament'} class:regular={tradingContext.mode === 'regular'}>
+			<span class="mode-label">MODE:</span>
+			{#if tradingContext.mode === 'tournament'}
+				<span class="mode-value">TOURNAMENT #{tradingContext.tournamentId}</span>
+				<button class="mode-switch-btn" on:click={() => tradingModeStore.setRegularMode()}>
+					SWITCH TO REGULAR
+				</button>
+			{:else}
+				<span class="mode-value">REGULAR TRADING</span>
+				<a href="/competition" class="mode-switch-btn">VIEW TOURNAMENTS</a>
 			{/if}
 		</div>
 		<div class="wallet-section">
@@ -988,7 +1089,45 @@
 			{#if connectedWallet?.connected}
 				{@const currentPairIndex = TRADING_PAIRS[selectedTab]}
 				<div class="token-balances">
-					{#if mockTokenBalances[currentPairIndex]}
+					{#if tradingContext.mode === 'tournament' && tournamentParticipantData}
+						{@const currentPrice = prices[selectedTab]?.price || 0}
+						{@const tokenBalanceMap = {
+							'SOL': tournamentParticipantData.solBalance,
+							'BTC': tournamentParticipantData.btcBalance,
+							'ETH': tournamentParticipantData.ethBalance,
+							'AVAX': tournamentParticipantData.avaxBalance,
+							'LINK': tournamentParticipantData.linkBalance
+						}}
+						{@const tokenBalance = tokenBalanceMap[selectedTab] || 0}
+						{@const totalValue = tournamentParticipantData.usdtBalance + (tokenBalance * currentPrice)}
+						{@const pnl = totalValue - 10000}
+						<div class="balance-row">
+							<div class="pair-info">
+								<span class="pair-name">{selectedTab}/USDT</span>
+								<span class="pair-status">TOURNAMENT</span>
+							</div>
+							<div class="balance-amounts">
+								<div class="token-balance">
+									<span class="token-label">USDT:</span>
+									<span class="token-amount">{tournamentParticipantData.usdtBalance.toFixed(2)}</span>
+								</div>
+								<div class="token-balance">
+									<span class="token-label">{selectedTab}:</span>
+									<span class="token-amount">{tokenBalance.toFixed(4)}</span>
+								</div>
+							</div>
+						</div>
+					{:else if tradingContext.mode === 'tournament' && !tournamentParticipantData}
+						<div class="balance-row not-initialized">
+							<div class="pair-info">
+								<span class="pair-name">{selectedTab}/USDT</span>
+								<span class="pair-status">NOT JOINED</span>
+							</div>
+							<div class="initialize-hint">
+								<span class="hint-text">Visit COMPETITION page to join this tournament</span>
+							</div>
+						</div>
+					{:else if mockTokenBalances[currentPairIndex]}
 						{@const currentPrice = prices[selectedTab]?.price || 0}
 					{@const totalValue = mockTokenBalances[currentPairIndex].tokenInBalance + (mockTokenBalances[currentPairIndex].tokenOutBalance * currentPrice)}
 					{@const pnl = totalValue - 10000}
@@ -1307,8 +1446,24 @@
 		gap: 10px;
 		border-bottom: 1px solid #333;
 		flex-wrap: nowrap;
-		overflow: hidden;
+		overflow-x: auto;
+		overflow-y: hidden;
 		min-height: 50px;
+		scrollbar-width: thin;
+		scrollbar-color: #ff9500 #1a1a1a;
+	}
+
+	.command-bar::-webkit-scrollbar {
+		height: 6px;
+	}
+
+	.command-bar::-webkit-scrollbar-track {
+		background: #1a1a1a;
+	}
+
+	.command-bar::-webkit-scrollbar-thumb {
+		background: #ff9500;
+		border-radius: 3px;
 	}
 
 	.logo {
@@ -1317,11 +1472,14 @@
 		color: #ff9500;
 		letter-spacing: 2px;
 		text-decoration: none;
+		flex-shrink: 0;
+		white-space: nowrap;
 	}
 
 	.nav-links {
 		display: flex;
 		gap: 15px;
+		flex-shrink: 0;
 	}
 
 	.nav-link {
@@ -1331,6 +1489,8 @@
 		padding: 4px 10px;
 		border: 1px solid transparent;
 		transition: all 0.2s;
+		flex-shrink: 0;
+		white-space: nowrap;
 	}
 
 	.nav-link:hover {
@@ -1344,13 +1504,14 @@
 	}
 
 	.command-input {
-		flex: 1;
+		min-width: 200px;
 		background: #000;
 		border: 1px solid #ff9500;
 		color: #ff9500;
 		padding: 6px 12px;
 		font-family: 'Courier New', monospace;
 		font-size: 13px;
+		flex-shrink: 1;
 	}
 
 	.command-input::placeholder {
@@ -1366,6 +1527,8 @@
 		font-size: 14px;
 		cursor: pointer;
 		font-family: inherit;
+		flex-shrink: 0;
+		white-space: nowrap;
 	}
 
 	.go-button:hover {
@@ -1465,6 +1628,63 @@
 		transform: scale(1.05);
 	}
 
+	.trading-mode-indicator {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 10px;
+		padding: 4px 8px;
+		border: 1px solid #333;
+		flex-shrink: 0;
+	}
+
+	.trading-mode-indicator.regular {
+		background: #000;
+		color: #666;
+	}
+
+	.trading-mode-indicator.tournament {
+		background: #1a1a00;
+		color: #ff9500;
+		border-color: #ff9500;
+		animation: pulse-border 2s infinite;
+	}
+
+	@keyframes pulse-border {
+		0%, 100% { border-color: #ff9500; }
+		50% { border-color: #ffaa00; }
+	}
+
+	.mode-label {
+		color: #999;
+		font-weight: bold;
+	}
+
+	.mode-value {
+		color: inherit;
+		font-weight: bold;
+	}
+
+	.mode-switch-btn {
+		background: #333;
+		color: #fff;
+		border: 1px solid #666;
+		padding: 3px 8px;
+		font-size: 9px;
+		font-weight: bold;
+		cursor: pointer;
+		margin-left: 6px;
+		font-family: 'Courier New', monospace;
+		letter-spacing: 1px;
+		text-decoration: none;
+		display: inline-block;
+		transition: all 0.2s ease;
+	}
+
+	.mode-switch-btn:hover {
+		background: #444;
+	}
+
 	.competition-timer {
 		display: flex;
 		align-items: center;
@@ -1493,6 +1713,7 @@
 	.wallet-section {
 		display: flex;
 		align-items: center;
+		flex-shrink: 0;
 	}
 
 	.clock {
@@ -1561,6 +1782,23 @@
 		gap: 2px;
 		padding: 0 15px;
 		border-bottom: 1px solid #333;
+		overflow-x: auto;
+		flex-wrap: nowrap;
+		scrollbar-width: thin;
+		scrollbar-color: #ff9500 #1a1a1a;
+	}
+
+	.tabs::-webkit-scrollbar {
+		height: 6px;
+	}
+
+	.tabs::-webkit-scrollbar-track {
+		background: #1a1a1a;
+	}
+
+	.tabs::-webkit-scrollbar-thumb {
+		background: #ff9500;
+		border-radius: 3px;
 	}
 
 	.tab {
@@ -1573,6 +1811,8 @@
 		cursor: pointer;
 		border-top: 2px solid transparent;
 		transition: all 0.2s ease;
+		flex-shrink: 0;
+		white-space: nowrap;
 	}
 
 	.tab.active {
@@ -1587,7 +1827,8 @@
 
 	/* News Ticker */
 	.news-ticker-container {
-		flex: 1;
+		min-width: 200px;
+		flex-shrink: 1;
 		overflow: hidden;
 		position: relative;
 		background: #0a0a0a;
