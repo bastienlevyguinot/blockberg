@@ -796,6 +796,7 @@
 		<a href="/" class="logo">BLOCKBERG</a>
 		<div class="nav-links">
 			<a href="/" class="nav-link active">TERMINAL</a>
+			<a href="/dashboard" class="nav-link">DASHBOARD</a>
 			<a href="/competition" class="nav-link">COMPETITION</a>
 		</div>
 		<input
@@ -975,66 +976,6 @@
 				></iframe>
 			</div>
 
-	
-			{#if onChainPositions.length > 0}
-				<div class="positions-panel">
-					<div class="positions-header">
-						ON-CHAIN POSITIONS
-						<button class="refresh-positions-btn" on:click={fetchOnChainPositions} title="Refresh positions">↻</button>
-					</div>
-					
-					<!-- On-Chain Positions Only -->
-							{#each onChainPositions as position}
-								<div class="position-row onchain-position">
-									<div class="position-info">
-										{#if position.type === 'direct'}
-											<span class="position-direction" class:long={position.direction === 'LONG'} class:short={position.direction === 'SHORT'}>
-												{position.direction}
-											</span>
-											<span class="position-size">{position.amountTokenOut.toFixed(4)} {selectedTab}</span>
-										{:else}
-											<span class="position-direction onchain">
-												MAGICBLOCK
-											</span>
-										{/if}
-										<span class="position-address">{position.pubkey.substring(0, 8)}...</span>
-									</div>
-									<div class="position-details">
-										{#if position.type === 'direct'}
-											<div class="position-row">
-												<span>Entry: ${position.entryPrice.toFixed(2)}</span>
-												<span>Size: {position.amountTokenOut.toFixed(4)} {position.pairSymbol}</span>
-											</div>
-											<div class="position-row">
-												<span class="position-current-price">
-													Current: ${prices[position.pairSymbol]?.price.toFixed(2) || 'Loading...'}
-												</span>
-												{#if position.takeProfitPrice}
-													<span class="tp-price">TP: ${position.takeProfitPrice.toFixed(2)}</span>
-												{/if}
-											</div>
-											<div class="position-row">
-												{#if position.stopLossPrice}
-													<span class="sl-price">SL: ${position.stopLossPrice.toFixed(2)}</span>
-												{/if}
-												<span class="position-time">
-													Opened: {position.openedAt.toLocaleString()}
-												</span>
-											</div>
-											<div class="position-row">
-												<span class={((position.direction === 'LONG' ? (prices[position.pairSymbol]?.price || position.entryPrice) - position.entryPrice : position.entryPrice - (prices[position.pairSymbol]?.price || position.entryPrice)) * position.amountTokenOut >= 0) ? 'pnl-up' : 'pnl-down'}>
-													P&L: ${((position.direction === 'LONG' ? (prices[position.pairSymbol]?.price || position.entryPrice) - position.entryPrice : position.entryPrice - (prices[position.pairSymbol]?.price || position.entryPrice)) * position.amountTokenOut).toFixed(2)}
-												</span>
-											</div>
-										{:else}
-											<span class="position-data">Data: {position.data}</span>
-										{/if}
-									</div>
-									<button class="close-button" on:click={() => closePosition(position.pubkey)}>CLOSE</button>
-								</div>
-							{/each}
-				</div>
-			{/if}
 		</div>
 
 		<div class="panel leaderboard-panel">

@@ -33,12 +33,12 @@ export const TRADING_PAIRS = {
 export const TOKEN_DECIMALS = {
 	// token_in (quote tokens - typically USDT)
 	USDT: 6,
-	// token_out (base tokens)
+	// token_out (base tokens) - using 8-9 decimals to avoid u64 overflow
 	SOL: 9,
 	BTC: 8,
-	ETH: 18,
-	AVAX: 18,
-	LINK: 18,
+	ETH: 8,
+	AVAX: 8,
+	LINK: 8,
 };
 
 export const PAIR_DECIMALS = {
@@ -1062,6 +1062,265 @@ export class MagicBlockClient {
 		} catch (error) {
 			throw error;
 		}
+	}
+
+	async fetchSpotTradeHistory(): Promise<any[]> {
+		const currentWallet = this.getCurrentWallet();
+		if (!currentWallet) {
+			return [];
+		}
+
+		const spotTrades: any[] = [];
+
+		try {
+			// Fetch transaction history for each trading pair's user account
+			for (const [symbol, pairIndex] of Object.entries(TRADING_PAIRS)) {
+				try {
+					const [userAccountPDA] = this.getUserAccountPDA(currentWallet.publicKey, pairIndex);
+
+					// Get recent transactions for this account
+					const signatures = await this.connection.getSignaturesForAddress(userAccountPDA, {
+						limit: 50 // Limit to last 50 transactions per pair
+					});
+
+					for (const sigInfo of signatures) {
+						try {
+							const tx = await this.connection.getTransaction(sigInfo.signature, {
+								maxSupportedTransactionVersion: 0
+							});
+
+							if (!tx || !tx.meta || tx.meta.err) continue;
+
+							// Parse the transaction to determine if it's a buy or sell
+							const message = tx.transaction.message;
+							const instructions = message.compiledInstructions || [];
+
+							for (const ix of instructions) {
+								// Check if this instruction is for our program
+								const programIdIndex = ix.programIdIndex;
+								const accountKeys = message.staticAccountKeys || message.accountKeys || [];
+
+								if (accountKeys[programIdIndex]?.toBase58() !== PAPER_TRADING_PROGRAM_ID.toBase58()) continue;
+
+								// Parse instruction data to determine type
+								const data = Buffer.from(ix.data);
+								if (data.length < 8) continue;
+
+								const discriminator = data.slice(0, 8);
+
+								// Calculate buy/sell discriminators
+								const buyDiscriminator = await this.getMethodDiscriminator('global:buy');
+								const sellDiscriminator = await this.getMethodDiscriminator('global:sell');
+
+								let tradeType: 'BUY' | 'SELL' | null = null;
+
+								if (discriminator.equals(buyDiscriminator)) {
+									tradeType = 'BUY';
+								} else if (discriminator.equals(sellDiscriminator)) {
+									tradeType = 'SELL';
+								}
+
+								if (tradeType && data.length >= 24) {
+									// Parse amount and price from instruction data
+									const amountTokenOut = data.readBigUInt64LE(8);
+									const priceScaled = data.readBigUInt64LE(16);
+
+									const pairDecimals = PAIR_DECIMALS[pairIndex as keyof typeof PAIR_DECIMALS];
+									const amount = Number(amountTokenOut) / Math.pow(10, pairDecimals.tokenOut);
+									const price = Number(priceScaled) / 1e6;
+									const value = amount * price;
+
+									spotTrades.push({
+										signature: sigInfo.signature,
+										tradeType,
+										pairIndex,
+										pairSymbol: symbol,
+										pair: `${symbol}/USDT`,
+										size: amount,
+										price,
+										value,
+										sizeUSDT: value,
+										date: new Date((tx.blockTime || 0) * 1000).toLocaleDateString(),
+										timestamp: new Date((tx.blockTime || 0) * 1000),
+										status: 'COMPLETED',
+										pnl: null // Spot trades don't have direct P&L
+									});
+								}
+							}
+						} catch (txError) {
+							// Skip failed transaction parsing
+						}
+					}
+				} catch (pairError) {
+					// Skip failed pair
+				}
+			}
+
+			// Sort by timestamp descending
+			spotTrades.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+		} catch (error) {
+			console.error('Error fetching spot trade history:', error);
+		}
+
+		return spotTrades;
+	}
+
+	private async getMethodDiscriminator(methodName: string): Promise<Buffer> {
+		const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(methodName));
+		return Buffer.from(new Uint8Array(hash).slice(0, 8));
+	}
+
+	async fetchTradeHistory(): Promise<any[]> {
+		const currentWallet = this.getCurrentWallet();
+		if (!currentWallet) {
+			return [];
+		}
+
+		const tradeHistory: any[] = [];
+
+		try {
+			const positionAccountSize = 104;
+
+			// Fetch ALL position accounts for this user (including closed)
+			const allAccounts = await this.connection.getProgramAccounts(PAPER_TRADING_PROGRAM_ID, {
+				filters: [
+					{
+						dataSize: positionAccountSize
+					},
+					{
+						memcmp: {
+							offset: 8, // Skip discriminator, match owner
+							bytes: currentWallet.publicKey.toBase58()
+						}
+					}
+				]
+			});
+
+			for (const accountInfo of allAccounts) {
+				try {
+					const data = accountInfo.account.data;
+					const dataView = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+					let offset = 8; // Skip discriminator
+
+					// owner: Pubkey (32 bytes)
+					offset += 32;
+
+					// pair_index: u8 (1 byte)
+					const pairIndex = data[offset];
+					offset += 1;
+
+					// position_id: u64 (8 bytes)
+					const positionId = dataView.getBigUint64(offset, true);
+					offset += 8;
+
+					// position_type: PositionType (1 byte) - 0 = Long, 1 = Short
+					const positionType = data[offset];
+					offset += 1;
+
+					// amount_token_out: u64 (8 bytes)
+					const amountTokenOut = dataView.getBigUint64(offset, true);
+					offset += 8;
+
+					// entry_price: u64 (8 bytes)
+					const entryPrice = dataView.getBigUint64(offset, true);
+					offset += 8;
+
+					// take_profit_price: u64 (8 bytes)
+					const takeProfitPrice = dataView.getBigUint64(offset, true);
+					offset += 8;
+
+					// stop_loss_price: u64 (8 bytes)
+					const stopLossPrice = dataView.getBigUint64(offset, true);
+					offset += 8;
+
+					// status: PositionStatus (1 byte) - 0 = Active, 1 = Closed
+					const status = data[offset];
+					offset += 1;
+
+					// opened_at: i64 (8 bytes)
+					const openedAt = dataView.getBigInt64(offset, true);
+					offset += 8;
+
+					// closed_at: i64 (8 bytes)
+					const closedAt = dataView.getBigInt64(offset, true);
+					offset += 8;
+
+					// exit_price: u64 (8 bytes) - if available in struct
+					let exitPrice = BigInt(0);
+					if (offset + 8 <= data.length) {
+						exitPrice = dataView.getBigUint64(offset, true);
+					}
+
+					// Get pair symbol and decimals
+					const pairSymbols = ['SOL', 'BTC', 'ETH', 'AVAX', 'LINK'];
+					const pairSymbol = pairSymbols[pairIndex] || 'UNKNOWN';
+					const pairDecimals = PAIR_DECIMALS[pairIndex as keyof typeof PAIR_DECIMALS];
+
+					if (!pairDecimals) continue;
+
+					const entryPriceNum = Number(entryPrice) / 1e6;
+					const exitPriceNum = exitPrice > 0 ? Number(exitPrice) / 1e6 : entryPriceNum;
+					const amountNum = Number(amountTokenOut) / Math.pow(10, pairDecimals.tokenOut);
+					const sizeUSDT = amountNum * entryPriceNum;
+
+					// Calculate P&L
+					let pnl = 0;
+					if (status === 1 && exitPrice > 0) { // Closed position
+						if (positionType === 0) { // Long
+							pnl = (exitPriceNum - entryPriceNum) * amountNum;
+						} else { // Short
+							pnl = (entryPriceNum - exitPriceNum) * amountNum;
+						}
+					}
+
+					tradeHistory.push({
+						pubkey: accountInfo.pubkey.toBase58(),
+						positionId: positionId.toString(),
+						direction: positionType === 0 ? 'LONG' : 'SHORT',
+						tradeType: positionType === 0 ? 'LONG' : 'SHORT',
+						pairIndex,
+						pairSymbol,
+						pair: `${pairSymbol}/USDT`,
+						type: status === 1 ? 'CLOSED' : 'OPEN',
+						size: amountNum,
+						sizeUSDT,
+						entryPrice: entryPriceNum,
+						exitPrice: status === 1 ? exitPriceNum : null,
+						takeProfitPrice: takeProfitPrice > 0 ? Number(takeProfitPrice) / 1e6 : null,
+						stopLossPrice: stopLossPrice > 0 ? Number(stopLossPrice) / 1e6 : null,
+						status: status === 0 ? 'ACTIVE' : 'CLOSED',
+						openedAt: new Date(Number(openedAt) * 1000),
+						closedAt: status === 1 ? new Date(Number(closedAt) * 1000) : null,
+						timestamp: status === 1 ? new Date(Number(closedAt) * 1000) : new Date(Number(openedAt) * 1000),
+						pnl
+					});
+				} catch (parseError) {
+					console.error('Error parsing position for history:', parseError);
+				}
+			}
+
+			// Also fetch spot trades
+			try {
+				const spotTrades = await this.fetchSpotTradeHistory();
+				tradeHistory.push(...spotTrades);
+			} catch (spotError) {
+				console.error('Error fetching spot trades:', spotError);
+			}
+
+			// Sort all trades by timestamp (most recent first)
+			tradeHistory.sort((a, b) => {
+				const dateA = a.timestamp || a.closedAt || a.openedAt;
+				const dateB = b.timestamp || b.closedAt || b.openedAt;
+				return dateB.getTime() - dateA.getTime();
+			});
+
+		} catch (error) {
+			console.error('Error fetching trade history:', error);
+		}
+
+		return tradeHistory;
 	}
 
 	async fetchPositions(): Promise<any[]> {
