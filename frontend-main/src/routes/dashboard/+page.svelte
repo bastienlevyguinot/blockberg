@@ -7,15 +7,16 @@
 	import Toast from '$lib/toast/Toast.svelte';
 	import { toastStore } from '$lib/toast/store';
 	import { supabase, isSupabaseConfigured } from '$lib/supabase';
+	import * as ENV from '$lib/env';
 
-	const hermesClient = new HermesClient('https://hermes.pyth.network', {});
+	const hermesClient = new HermesClient(ENV.HERMES_URL, {});
 
 	const PYTH_FEEDS = {
-		SOL: { id: '0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d', name: 'SOL/USD' },
-		BTC: { id: '0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43', name: 'BTC/USD' },
-		ETH: { id: '0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace', name: 'ETH/USD' },
-		AVAX: { id: '0x93da3352f9f1d105fdfe4971cfa80e9dd777bfc5d0f683ebb6e1294b92137bb7', name: 'AVAX/USD' },
-		LINK: { id: '0x8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221', name: 'LINK/USD' },
+		SOL: { id: ENV.PYTH_FEEDS.SOL, name: 'SOL/USD' },
+		BTC: { id: ENV.PYTH_FEEDS.BTC, name: 'BTC/USD' },
+		ETH: { id: ENV.PYTH_FEEDS.ETH, name: 'ETH/USD' },
+		AVAX: { id: ENV.PYTH_FEEDS.AVAX, name: 'AVAX/USD' },
+		LINK: { id: ENV.PYTH_FEEDS.LINK, name: 'LINK/USD' },
 	};
 
 	type PriceData = {

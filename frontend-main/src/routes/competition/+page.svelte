@@ -5,6 +5,7 @@
 	import { walletStore } from '$lib/wallet/stores';
 	import { tradingModeStore } from '$lib/stores/tradingMode';
 	import WalletButton from '$lib/wallet/WalletButton.svelte';
+	import * as ENV from '$lib/env';
 
 	// Tournament state
 	let tournaments: Tournament[] = [];
@@ -15,16 +16,14 @@
 	let hasJoined = false;
 
 	// Tournament IDs to hide from display
-	const HIDDEN_TOURNAMENT_IDS = new Set(['7414763778215203000', '4327537319689978400', '12206805485679546000']);
+	const HIDDEN_TOURNAMENT_IDS = new Set(['7414763778215203000', '4327537319689978400', '12206805485679546000', '7562650077706697000']);
 
 	// Filter out hidden tournaments
 	$: visibleTournaments = tournaments.filter(t => !HIDDEN_TOURNAMENT_IDS.has(String(t.id)));
 
-	// Active tournaments: Pending or Active, excluding Ended/Settled. Hide Pending if cooldown already passed (0)
+	// Active tournaments: Pending or Active, excluding Ended/Settled
 	$: activeTournaments = visibleTournaments.filter(t => {
 		if (t.status === TournamentStatus.Ended || t.status === TournamentStatus.Settled) return false;
-		// Pending with cooldown passed (cooldownEnd <= now) = don't display
-		if (t.status === TournamentStatus.Pending && t.cooldownEnd.getTime() <= Date.now()) return false;
 		return true;
 	});
 
@@ -119,11 +118,10 @@
 		try {
 			tournaments = await magicBlockClient.fetchTournaments();
 
-			// Filter to active list (exclude hidden, ended/settled, and Pending with cooldown passed)
+			// Filter to active list (exclude hidden, ended/settled)
 			const active = tournaments.filter(t => {
 				if (HIDDEN_TOURNAMENT_IDS.has(String(t.id))) return false;
 				if (t.status === TournamentStatus.Ended || t.status === TournamentStatus.Settled) return false;
-				if (t.status === TournamentStatus.Pending && t.cooldownEnd.getTime() <= Date.now()) return false;
 				return true;
 			});
 			// Auto-select: keep current if still in active list, else select first active/pending
@@ -299,15 +297,15 @@
 	async function fetchPrices() {
 		try {
 			const priceIds = {
-				'SOL': 'ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d',
-				'BTC': 'e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43',
-				'ETH': 'ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace',
-				'AVAX': '93da3352f9f1d105fdfe4971cfa80e9dd777bfc5d0f683ebb6e1294b92137bb7',
-				'LINK': '8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221'
+				'SOL': ENV.PYTH_FEEDS.SOL,
+				'BTC': ENV.PYTH_FEEDS.BTC,
+				'ETH': ENV.PYTH_FEEDS.ETH,
+				'AVAX': ENV.PYTH_FEEDS.AVAX,
+				'LINK': ENV.PYTH_FEEDS.LINK
 			};
 
 			for (const [symbol, priceId] of Object.entries(priceIds)) {
-				const response = await fetch(`https://hermes.pyth.network/v2/updates/price/latest?ids[]=${priceId}`);
+				const response = await fetch(`${ENV.HERMES_URL}/v2/updates/price/latest?ids[]=${priceId}`);
 				const data = await response.json();
 				if (data.parsed && data.parsed[0]) {
 					const priceData = data.parsed[0].price;
@@ -401,7 +399,7 @@
 	<div class="command-bar">
 		<a href="/" class="logo">BLOCKBERG</a>
 		<div class="nav-links">
-			<a href="/" class="nav-link">TERMINAL</a>
+			<a href="/terminal" class="nav-link">TERMINAL</a>
 			<a href="/competition" class="nav-link active">TOURNAMENTS</a>
 		</div>
 		<div class="status-bar">
@@ -521,7 +519,7 @@
 								{#if tournament.status === TournamentStatus.Active}
 									<button class="go-terminal-btn" on:click|stopPropagation={() => {
 										tradingModeStore.setTournamentMode(tournament.id);
-										goto('/');
+										goto('/terminal');
 									}}>
 										→ GO TO TERMINAL
 									</button>
@@ -589,7 +587,7 @@
 							<button class="trade-link" on:click={() => {
 								if (selectedTournamentId) {
 									tradingModeStore.setTournamentMode(selectedTournamentId);
-									goto('/');
+									goto('/terminal');
 								}
 							}}>→ GO TO TERMINAL TO TRADE</button>
 						</div>

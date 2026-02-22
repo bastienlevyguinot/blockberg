@@ -1,25 +1,26 @@
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, Transaction, sendAndConfirmTransaction, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import { FindEntityPda, ApplySystem, SerializeArgs, BN, anchor } from '@magicblock-labs/bolt-sdk';
 import type { Adapter, SignerWalletAdapter } from '@solana/wallet-adapter-base';
+import * as ENV from './env';
 
-export const MAGICBLOCK_RPC = 'https://rpc.magicblock.app/devnet/';
-export const SOLANA_RPC = 'https://api.devnet.solana.com';
+export const MAGICBLOCK_RPC = ENV.MAGICBLOCK_RPC;
+export const SOLANA_RPC = ENV.SOLANA_RPC;
 
 // Paper Trading Program ID from the contract
-export const PAPER_TRADING_PROGRAM_ID = new PublicKey('GTyA9zS7YrRJ7LQCqeKAYZa4yL2CSCaH6SmEALEWAXAk');
+export const PAPER_TRADING_PROGRAM_ID = new PublicKey(ENV.PAPER_TRADING_PROGRAM_ID);
 
 export const COMPONENT_IDS = {
-	TRADING_ACCOUNT: new PublicKey('3PDo9AKeLhU6hcUC7gft3PKQuotH4624mcevqdSiyTPS'),
-	COMPETITION: new PublicKey('FPKpeKHnfYuYo8JDiDW7mNzZB8qgf1mLYwpQAcbGyVhJ'),
-	POSITION: new PublicKey('9ACLRxNoDHXpHugLUmDtBGTQ6Q5vwnD4wUVSaWaNaVbv'),
-	LEADERBOARD: new PublicKey('BCrmcoi7dEgg7UY3SpZfM4dihAWaYuNk3wprXsy1Xp5X'),
+	TRADING_ACCOUNT: new PublicKey(ENV.COMPONENT_IDS.TRADING_ACCOUNT),
+	COMPETITION: new PublicKey(ENV.COMPONENT_IDS.COMPETITION),
+	POSITION: new PublicKey(ENV.COMPONENT_IDS.POSITION),
+	LEADERBOARD: new PublicKey(ENV.COMPONENT_IDS.LEADERBOARD),
 };
 
 export const SYSTEM_IDS = {
-	JOIN_COMPETITION: new PublicKey('5aJzg88rRLAFGN1imRwK84WMD4JyZBvz7n47nSQz9oGm'),
-	OPEN_POSITION: new PublicKey('GdWvbNgbNxWHbSDTBweSi9zPgtRhggGxaJsCxL5vwDp9'),
-	CLOSE_POSITION: new PublicKey('CXnKyp5DGMWRHsj9JsbECqBbDP1GeUF3c8AYSPZMmNd2'),
-	SETTLE_COMPETITION: new PublicKey('32S5nHLK93PNVJQZgd4PQY4v9tkiLU2j9bEbHhJN4CuL'),
+	JOIN_COMPETITION: new PublicKey(ENV.SYSTEM_IDS.JOIN_COMPETITION),
+	OPEN_POSITION: new PublicKey(ENV.SYSTEM_IDS.OPEN_POSITION),
+	CLOSE_POSITION: new PublicKey(ENV.SYSTEM_IDS.CLOSE_POSITION),
+	SETTLE_COMPETITION: new PublicKey(ENV.SYSTEM_IDS.SETTLE_COMPETITION),
 };
 
 export const TRADING_PAIRS = {
@@ -88,8 +89,8 @@ export enum PositionDirection {
 	Short = 'SHORT',
 }
 
-export const WORLD_ID = new BN(2409);
-export const WORLD_INSTANCE_ID = new PublicKey('CVndFdiiuFhkcLEQy71JomGwgZT8Lqeq9oFuU14E9Ngk');
+export const WORLD_ID = new BN(ENV.WORLD_ID);
+export const WORLD_INSTANCE_ID = new PublicKey(ENV.WORLD_INSTANCE_ID);
 
 export class MagicBlockClient {
 	connection: Connection;
@@ -330,7 +331,7 @@ export class MagicBlockClient {
 				seed: Buffer.from(currentWallet.publicKey.toBytes()),
 			});
 
-			this.competitionEntity = new PublicKey('5ebXENtrEamPapRhzMGjvrcavWwrEwWiY4Yftjx3wUsk');
+			this.competitionEntity = new PublicKey(ENV.COMPETITION_ENTITY);
 		} catch (e) {
 		}
 	}
